@@ -1,12 +1,13 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Optional
+from typing import Optional, Callable
 from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
 
 import flash_attn.cute.utils as utils
+
 
 
 @dataclass(frozen=True)
@@ -23,12 +24,15 @@ class AttentionMask:
     def apply_mask(
         self,
         acc_S: cute.Tensor,
+        head_idx: cutlass.Int32,
+        batch_idx: cutlass.Int32,
         m_block: cutlass.Int32,
         n_block: cutlass.Int32,
         thr_mma: cute.TiledMma,
         mask_seqlen: cutlass.Constexpr[bool],
         mask_causal: cutlass.Constexpr[bool],
         mask_local: cutlass.Constexpr[bool] = False,
+        mask_mod: Optional[Callable] = None,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_S_mn = utils.make_acc_tensor_mn_view(acc_S)
@@ -39,7 +43,7 @@ class AttentionMask:
         t0ScS_mn = utils.make_acc_tensor_mn_view(thr_mma.get_slice(0).partition_C(cS))
         thr_col_offset = tScS_mn[0][1]
         seqlenk_col_limit = self.seqlen_k - n_block * self.n_block_size - thr_col_offset
-        if cutlass.const_expr(not mask_causal and not mask_local):
+        if cutlass.const_expr(not mask_causal and not mask_local and mask_mod is None):
             if cutlass.const_expr(mask_seqlen):
                 if cutlass.const_expr(False):
                     # traverse column index.
@@ -61,6 +65,32 @@ class AttentionMask:
                             c = s * 24 + i
                             for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                                 acc_S_mn[r, c] = acc_S_mn[r, c] if in_bound else -cutlass.Float32.inf
+        elif cutlass.const_expr(not mask_causal and not mask_local and mask_mod is not None):
+            nrow = cutlass.const_expr(cute.size(tScS_mn.shape[0]))
+            ncol = cutlass.const_expr(cute.size(tScS_mn.shape[1]))
+
+            thr_col_offset = tScS_mn[0, 0][1]
+
+            for r in cutlass.range(nrow, unroll_full=True):
+                global_row_idx = tScS_mn[r, 0][0] + m_block * self.m_block_size
+
+                for c in cutlass.range(ncol, unroll_full=True):
+                    col_idx_local = t0ScS_mn[0, c][1]
+                    # Convert to absolute column index
+                    global_col_idx = thr_col_offset + col_idx_local + n_block * self.n_block_size
+
+                    if cutlass.const_expr(mask_seqlen):
+                        out_of_bounds = (global_row_idx >= self.seqlen_q) or (global_col_idx >= self.seqlen_k)
+                        if out_of_bounds:
+                            acc_S_mn[r, c] = -cutlass.Float32.inf
+                        else:
+                            cond = cutlass.Boolean(mask_mod(head_idx, batch_idx, global_row_idx, global_col_idx))
+                            acc_S_mn[r, c] = acc_S_mn[r, c] if cond else -cutlass.Float32.inf
+                    else:
+                        cond = cutlass.Boolean(mask_mod(head_idx, batch_idx, global_row_idx, global_col_idx))
+                        acc_S_mn[r, c] = acc_S_mn[r, c] if cond else -cutlass.Float32.inf
+
+
         else:  # Causal or local
             # If PackGQA, we split the work of compute divmod among threads in the same row
             threads_per_row = thr_mma.tv_layout_C.shape[0][0]
@@ -76,6 +106,12 @@ class AttentionMask:
             causal_row_offset = (
                 1 + self.seqlen_k - n_block * self.n_block_size - self.seqlen_q - thr_col_offset
             )
+            c = 0
+            col_limit_transformed = 0
+            ncol: cute.Constexpr = 0
+            col_limit_right_s = 0
+            mask = 0
+            in_bound = False
             if cutlass.const_expr(mask_causal):
                 for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                     # get the column index limit based on current row. Only consider the row index, so the column index sets to 0.
@@ -113,6 +149,7 @@ class AttentionMask:
                     if cutlass.const_expr(self.window_size_left is not None)
                     else None
                 )
+                # c = 0
                 for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                     if cutlass.const_expr(self.qhead_per_kvhead_packgqa == 1):
                         row_idx = tScS_mn[r, 0][0] + m_block * self.m_block_size
@@ -133,6 +170,7 @@ class AttentionMask:
                     # traverse column index.
                     for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
                         col_idx = t0ScS_mn[0, c][1]
+                        acc_S_mn = utils.make_acc_tensor_mn_view(acc_S)
                         # only consider the column index, so the row index sets to 0.
                         if col_idx >= col_limit_right or col_idx < col_limit_left:
                             acc_S_mn[r, c] = -cutlass.Float32.inf
