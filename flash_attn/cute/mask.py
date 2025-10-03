@@ -65,6 +65,7 @@ class AttentionMask:
                             c = s * 24 + i
                             for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                                 acc_S_mn[r, c] = acc_S_mn[r, c] if in_bound else -cutlass.Float32.inf
+                                
         elif cutlass.const_expr(not mask_causal and not mask_local and mask_mod is not None):
             nrow = cutlass.const_expr(cute.size(tScS_mn.shape[0]))
             ncol = cutlass.const_expr(cute.size(tScS_mn.shape[1]))
@@ -74,21 +75,21 @@ class AttentionMask:
             for r in cutlass.range(nrow, unroll_full=True):
                 global_row_idx = tScS_mn[r, 0][0] + m_block * self.m_block_size
 
-                for c in cutlass.range(ncol, unroll_full=True):
-                    col_idx_local = t0ScS_mn[0, c][1]
+                for col in cutlass.range(ncol, unroll_full=True):
+                    col_idx_local = t0ScS_mn[0, col][1]
                     # Convert to absolute column index
                     global_col_idx = thr_col_offset + col_idx_local + n_block * self.n_block_size
 
                     if cutlass.const_expr(mask_seqlen):
                         out_of_bounds = (global_row_idx >= self.seqlen_q) or (global_col_idx >= self.seqlen_k)
                         if out_of_bounds:
-                            acc_S_mn[r, c] = -cutlass.Float32.inf
+                            acc_S_mn[r, col] = -cutlass.Float32.inf
                         else:
                             cond = cutlass.Boolean(mask_mod(head_idx, batch_idx, global_row_idx, global_col_idx))
-                            acc_S_mn[r, c] = acc_S_mn[r, c] if cond else -cutlass.Float32.inf
+                            acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
                     else:
                         cond = cutlass.Boolean(mask_mod(head_idx, batch_idx, global_row_idx, global_col_idx))
-                        acc_S_mn[r, c] = acc_S_mn[r, c] if cond else -cutlass.Float32.inf
+                        acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
 
 
         else:  # Causal or local

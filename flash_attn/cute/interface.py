@@ -1,5 +1,5 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-# [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'd need to install nvidia-cutlass-dsl==4.1.0.
+# [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'll need install nvidia-cutlass-dsl==4.2.0.
 
 # Supported features:
 # - BF16 & FP16 dtype
@@ -20,7 +20,7 @@
 # - bwd pass optimized for Hopper/Blackwell
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Callable
 
 import torch
 
@@ -65,6 +65,13 @@ def _flash_attn_fwd(
     window_size_left: Optional[int] = None,
     window_size_right: Optional[int] = None,
     learnable_sink: Optional[torch.Tensor] = None,
+    mask_mod: Optional[Callable] = None,
+    use_mask_mod_tensor: bool = False,
+    full_block_cnt: Optional[torch.Tensor] = None,
+    full_block_idx: Optional[torch.Tensor] = None,
+    mask_block_cnt: Optional[torch.Tensor] = None,
+    mask_block_idx: Optional[torch.Tensor] = None,
+    mask_mod_tensor: Optional[torch.Tensor] = None,
     # m_block_size: int = 128,
     # n_block_size: int = 64,
     # num_threads: int = 128,
@@ -120,7 +127,24 @@ def _flash_attn_fwd(
     if learnable_sink is not None:
         assert learnable_sink.shape == (num_head,)
         assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
-    assert all(t is None or t.is_cuda for t in (q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table, learnable_sink)), "inputs must be on CUDA device"
+    for t in [full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx]:
+        if t is not None:
+            assert t.dtype == torch.int32, "blocksparse mask tensors must be int32"
+            assert t.stride(0) == 1, "blocksparse mask tensors must be contiguous"
+    assert mask_mod_tensor is None, "no support for mask_mod_tensor yet"
+    assert all(
+        t is None or t.is_cuda
+        for t in (
+            q, k, v,
+            cu_seqlens_q, cu_seqlens_k,
+            seqused_q, seqused_k,
+            page_table,
+            learnable_sink,
+            full_block_cnt, full_block_idx,
+            mask_block_cnt, mask_block_idx,
+            mask_mod_tensor,
+        )
+    ), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     assert head_dim <= 256, "head_dim must be less than or equal to 256"
     alignment = 16 // q.element_size()
@@ -153,6 +177,13 @@ def _flash_attn_fwd(
         for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
     ]
     page_table_tensor = from_dlpack(page_table.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1) if page_table is not None else None
+    
+    full_block_cnt_tensor = from_dlpack(full_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=2) if full_block_cnt is not None else None
+    full_block_idx_tensor = from_dlpack(full_block_idx.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=3) if full_block_idx is not None else None
+    mask_block_cnt_tensor = from_dlpack(mask_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=2) if mask_block_cnt is not None else None
+    mask_block_idx_tensor = from_dlpack(mask_block_idx.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=3) if mask_block_idx is not None else None
+    mask_mod_tensor_cute = from_dlpack(mask_mod_tensor.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0) if mask_mod_tensor is not None else None
+    
     if causal:
         window_size_right = 0
     local = window_size_left is not None or window_size_right is not None
@@ -172,7 +203,7 @@ def _flash_attn_fwd(
         # TODO: fix the varlen case
         if pack_gqa and (128 % qhead_per_kvhead != 0) or (cu_seqlens_q is not None or seqused_q is not None):
             pack_gqa = False
-
+    mask_mod_hash = utils.hash_callable(mask_mod)
     compile_key = (
         dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap is not None,
         lse is None, cu_seqlens_q is None, cu_seqlens_k is None, seqused_q is None, seqused_k is None,
@@ -180,6 +211,7 @@ def _flash_attn_fwd(
         window_size_left is not None, window_size_right is not None,
         learnable_sink is not None,
         m_block_size, n_block_size, num_threads, pack_gqa,
+        mask_mod_hash, use_mask_mod_tensor,
         compute_capability,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -200,6 +232,10 @@ def _flash_attn_fwd(
                 num_stages=2,
                 num_threads=num_threads,
                 Q_in_regs=False,
+                intra_wg_overlap=True,
+                mma_pv_is_rs=True,
+                mask_mod=mask_mod,
+                use_mask_mod_tensor=use_mask_mod_tensor,
             )
         elif compute_capability == 10:
             assert page_size in [None, 128], "Only page_size=128 is supported for paged KV on SM 10.0"
@@ -215,18 +251,38 @@ def _flash_attn_fwd(
         else:
             raise ValueError(f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x")
         # TODO: check @can_implement
-        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
-            fa_fwd, q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
+        if compute_capability == 9: # mask mod only supported on hopper
+            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+                fa_fwd, q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
+                cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
+                page_table_tensor,
+                softcap, window_size_left, window_size_right, learnable_sink_tensor,
+                full_block_cnt_tensor, full_block_idx_tensor, mask_block_cnt_tensor, mask_block_idx_tensor,
+                mask_mod_tensor_cute,
+            )
+        else:
+            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+                fa_fwd, q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
+                cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
+                page_table_tensor,
+                softcap, window_size_left, window_size_right, learnable_sink_tensor,
+            )
+    if compute_capability == 9:
+        _flash_attn_fwd.compile_cache[compile_key](
+            q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
+            cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
+            page_table_tensor,
+            softcap, window_size_left, window_size_right, learnable_sink_tensor,
+            full_block_cnt_tensor, full_block_idx_tensor, mask_block_cnt_tensor, mask_block_idx_tensor,
+            mask_mod_tensor_cute,
+        )
+    else:
+        _flash_attn_fwd.compile_cache[compile_key](
+            q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
             cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
             page_table_tensor,
             softcap, window_size_left, window_size_right, learnable_sink_tensor,
         )
-    _flash_attn_fwd.compile_cache[compile_key](
-        q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
-        cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
-        page_table_tensor,
-        softcap, window_size_left, window_size_right, learnable_sink_tensor,
-    )
     return out, lse
 
 
@@ -431,6 +487,13 @@ class FlashAttnFunc(torch.autograd.Function):
         learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
         pack_gqa: Optional[bool] = None,
+        mask_mod: Optional[Callable] = None,
+        use_mask_mod_tensor: bool = False,
+        full_block_cnt: Optional[torch.Tensor] = None,
+        full_block_idx: Optional[torch.Tensor] = None,
+        mask_block_cnt: Optional[torch.Tensor] = None,
+        mask_block_idx: Optional[torch.Tensor] = None,
+        mask_mod_tensor: Optional[torch.Tensor] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -443,6 +506,13 @@ class FlashAttnFunc(torch.autograd.Function):
             learnable_sink=learnable_sink,
             softcap=softcap,
             pack_gqa=pack_gqa,
+            mask_mod=mask_mod,
+            use_mask_mod_tensor=use_mask_mod_tensor,
+            full_block_cnt=full_block_cnt,
+            full_block_idx=full_block_idx,
+            mask_block_cnt=mask_block_cnt,
+            mask_block_idx=mask_block_idx,
+            mask_mod_tensor=mask_mod_tensor,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
@@ -530,6 +600,13 @@ def flash_attn_func(
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
     pack_gqa: Optional[bool] = None,
+    mask_mod: Optional[Callable] = None,
+    use_mask_mod_tensor: bool = False,
+    full_block_cnt: Optional[torch.Tensor] = None,
+    full_block_idx: Optional[torch.Tensor] = None,
+    mask_block_cnt: Optional[torch.Tensor] = None,
+    mask_block_idx: Optional[torch.Tensor] = None,
+    mask_mod_tensor: Optional[torch.Tensor] = None,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -541,6 +618,13 @@ def flash_attn_func(
         learnable_sink,
         softcap,
         pack_gqa,
+        mask_mod,
+        use_mask_mod_tensor,
+        full_block_cnt,
+        full_block_idx,
+        mask_block_cnt,
+        mask_block_idx,
+        mask_mod_tensor,
     )
 
 

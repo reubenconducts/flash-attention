@@ -1,0 +1,363 @@
+import math
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+from cutlass.cute.runtime import from_dlpack
+import pytest
+import torch
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+import torch.nn.functional as F
+
+from flash_attn.cute.block_sparsity import compute_block_sparsity
+from flash_attn.cute.flash_fwd import (
+    FlashAttentionForwardSm80,
+    FlashAttentionForwardSm90,
+)
+from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+from flash_attn.cute.mask_definitions import MASK_FUNCTIONS, flex_causal_mask
+
+
+def create_tensors(
+    batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim_v, dtype
+):
+    device = "cuda"
+    q = torch.randn(batch_size, seqlen_q, nheads, headdim, device=device, dtype=dtype)
+    k = torch.randn(
+        batch_size, seqlen_k, nheads_kv, headdim, device=device, dtype=dtype
+    )
+    v = torch.randn(
+        batch_size, seqlen_k, nheads_kv, headdim_v, device=device, dtype=dtype
+    )
+    out = torch.empty(
+        batch_size, seqlen_q, nheads, headdim_v, device=device, dtype=dtype
+    )
+    lse = torch.empty(batch_size, nheads, seqlen_q, device=device, dtype=torch.float32)
+
+    return {
+        "q": q.contiguous(),
+        "k": k.contiguous(),
+        "v": v.contiguous(),
+        "out": out.contiguous(),
+        "lse": lse.contiguous(),
+    }
+
+
+def compile_and_run_kernel(
+    tensors,
+    mask_mod_cute,
+    causal,
+    m_block_size,
+    n_block_size,
+    full_block_cnt=None,
+    full_block_idx=None,
+    mask_block_cnt=None,
+    mask_block_idx=None,
+):
+    dtype_map = {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }
+    cute_dtype = dtype_map[tensors["q"].dtype]
+
+    batch_size, seqlen_q, nheads, headdim = tensors["q"].shape
+    _, seqlen_k, nheads_kv, _ = tensors["k"].shape
+    headdim_v = tensors["v"].shape[-1]
+
+    compute_capability = torch.cuda.get_device_capability()
+    if compute_capability >= (10, 0):
+        kernel_class = FlashAttentionForwardSm100
+    elif compute_capability >= (9, 0):
+        kernel_class = FlashAttentionForwardSm90
+    else:
+        kernel_class = FlashAttentionForwardSm80
+
+    qhead_per_kvhead = nheads // nheads_kv
+    kernel = kernel_class(
+        cute_dtype,
+        headdim,
+        headdim_v,
+        qhead_per_kvhead,
+        is_causal=causal,
+        is_local=False,
+        pack_gqa=False,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        num_stages=2,
+        num_threads=384,
+        intra_wg_overlap=True,
+        mma_pv_is_rs=True,
+        mask_mod=mask_mod_cute,
+        use_mask_mod_tensor=False,
+        Q_in_regs=False,
+    )
+
+    softmax_scale = 1.0 / math.sqrt(headdim)
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    q_cute = from_dlpack(tensors["q"].detach(), assumed_align=16).mark_layout_dynamic(
+        leading_dim=tensors["q"].ndim - 1
+    )
+    k_cute = from_dlpack(tensors["k"].detach(), assumed_align=16).mark_layout_dynamic(
+        leading_dim=tensors["k"].ndim - 1
+    )
+    v_cute = from_dlpack(tensors["v"].detach(), assumed_align=16).mark_layout_dynamic(
+        leading_dim=tensors["v"].ndim - 1
+    )
+    out_cute = from_dlpack(
+        tensors["out"].detach(), assumed_align=16
+    ).mark_layout_dynamic(leading_dim=tensors["out"].ndim - 1)
+    lse_cute = from_dlpack(
+        tensors["lse"].detach(), assumed_align=4
+    ).mark_layout_dynamic(leading_dim=tensors["lse"].ndim - 1)
+
+    full_block_cnt_cute = (
+        from_dlpack(full_block_cnt.detach(), assumed_align=4)
+        if full_block_cnt is not None
+        else None
+    )
+    full_block_idx_cute = (
+        from_dlpack(full_block_idx.detach(), assumed_align=4)
+        if full_block_idx is not None
+        else None
+    )
+    mask_block_cnt_cute = (
+        from_dlpack(mask_block_cnt.detach(), assumed_align=4)
+        if mask_block_cnt is not None
+        else None
+    )
+    mask_block_idx_cute = (
+        from_dlpack(mask_block_idx.detach(), assumed_align=4)
+        if mask_block_idx is not None
+        else None
+    )
+
+    compiled = cute.compile(
+        kernel,
+        q_cute,
+        k_cute,
+        v_cute,
+        out_cute,
+        lse_cute,
+        softmax_scale,
+        current_stream,
+        full_block_cnt=full_block_cnt_cute,
+        full_block_idx=full_block_idx_cute,
+        mask_block_cnt=mask_block_cnt_cute,
+        mask_block_idx=mask_block_idx_cute,
+    )
+
+    compiled(
+        q_cute,
+        k_cute,
+        v_cute,
+        out_cute,
+        lse_cute,
+        softmax_scale,
+        current_stream,
+        full_block_cnt=full_block_cnt_cute,
+        full_block_idx=full_block_idx_cute,
+        mask_block_cnt=mask_block_cnt_cute,
+        mask_block_idx=mask_block_idx_cute,
+    )
+
+    torch.cuda.synchronize()
+    return tensors["out"]
+
+
+def compute_reference(
+    tensors, mask_mod_flex, mask_mod_name, causal, m_block_size, n_block_size
+):
+    batch_size, seqlen_q, nheads, headdim = tensors["q"].shape
+    _, seqlen_k, nheads_kv, _ = tensors["k"].shape
+
+    q = tensors["q"].transpose(1, 2)
+    k = tensors["k"].transpose(1, 2)
+    v = tensors["v"].transpose(1, 2)
+
+    if nheads != nheads_kv:
+        repeat_factor = nheads // nheads_kv
+        k = k.repeat_interleave(repeat_factor, dim=1)
+        v = v.repeat_interleave(repeat_factor, dim=1)
+
+    scale = 1.0 / math.sqrt(headdim)
+
+    if mask_mod_flex is not None:
+        mask_fn = mask_mod_flex
+    elif causal:
+        mask_fn = flex_causal_mask
+    else:
+        mask_fn = None
+
+    if mask_fn is not None:
+        if mask_mod_name == "block_causal":
+            n_blocks_q = (seqlen_q + m_block_size - 1) // m_block_size
+            n_blocks_k = (seqlen_k + n_block_size - 1) // n_block_size
+
+            mask = torch.zeros(seqlen_q, seqlen_k, dtype=torch.bool, device=q.device)
+
+            for q_block in range(n_blocks_q):
+                q_start = q_block * m_block_size
+                q_end = min((q_block + 1) * m_block_size, seqlen_q)
+                for k_block in range(n_blocks_k):
+                    if k_block <= q_block:
+                        k_start = k_block * n_block_size
+                        k_end = min((k_block + 1) * n_block_size, seqlen_k)
+                        mask[q_start:q_end, k_start:k_end] = True
+
+            attn_mask = (
+                mask.unsqueeze(0).unsqueeze(0).expand(batch_size, nheads, -1, -1)
+            )
+            out_ref = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, scale=scale
+            )
+        else:
+            block_mask = create_block_mask(
+                mask_fn,
+                B=batch_size,
+                H=nheads,
+                Q_LEN=seqlen_q,
+                KV_LEN=seqlen_k,
+            ).to(q.device)
+            out_ref = flex_attention(q, k, v, block_mask=block_mask, scale=scale)
+    else:
+        out_ref = F.scaled_dot_product_attention(q, k, v, scale=scale)
+
+    return out_ref.transpose(1, 2).contiguous()
+
+
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (64, 128),
+        (128, 192),
+        (256, 256),
+        (113, 203),
+        (113, 128),
+        (128, 217),
+        (256, 512),
+        (512, 256),
+        (1024, 1024),
+    ],
+)
+@pytest.mark.parametrize("nheads,nheads_kv", [(4, 4), (8, 2)])
+@pytest.mark.parametrize("headdim", [128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize(
+    "mask_name", ["identity", "causal", "block_causal", "sliding_window"]
+)
+def test_mask_mod_accuracy(
+    seqlen_q, seqlen_k, nheads, nheads_kv, headdim, dtype, mask_name
+):
+    torch.manual_seed(42)
+
+    batch_size = 2
+    headdim_v = headdim
+    m_block_size = 128
+    n_block_size = 128
+
+    mask_mod_cute, mask_mod_flex = MASK_FUNCTIONS[mask_name]
+
+    tensors = create_tensors(
+        batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim_v, dtype
+    )
+
+    # Compute block sparsity
+    from dataclasses import dataclass
+
+    @dataclass
+    class Config:
+        seqlen_q: int
+        seqlen_k: int
+        nheads: int
+        nheads_kv: int
+        batch_size: int
+        m_block_size: int
+        n_block_size: int
+        use_mask_mod: bool
+        mask_mod_name: str
+        verbose: bool = False
+
+    config = Config(
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        nheads=nheads,
+        nheads_kv=nheads_kv,
+        batch_size=batch_size,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        use_mask_mod=True,
+        mask_mod_name=mask_name,
+    )
+
+    full_cnt, full_idx, mask_cnt, mask_idx = compute_block_sparsity(
+        config=config, mask_mod_flex=mask_mod_flex, device="cuda"
+    )
+
+    # Run kernel
+    out_cute = compile_and_run_kernel(
+        tensors,
+        mask_mod_cute,
+        causal=False,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        full_block_cnt=full_cnt,
+        full_block_idx=full_idx,
+        mask_block_cnt=mask_cnt,
+        mask_block_idx=mask_idx,
+    )
+
+    # Compute reference at fp32
+    tensors_fp32 = {
+        k: v.float() if v.dtype in [torch.float16, torch.bfloat16] else v
+        for k, v in tensors.items()
+    }
+    out_ref_fp32 = compute_reference(
+        tensors_fp32,
+        mask_mod_flex,
+        mask_name,
+        causal=False,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+    )
+
+    # Compute reference at original dtype
+    out_ref = compute_reference(
+        tensors,
+        mask_mod_flex,
+        mask_name,
+        causal=False,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+    )
+
+    # Check for invalid values
+    assert out_cute.shape == out_ref_fp32.shape == out_ref.shape
+    assert not torch.isnan(out_cute).any()
+    assert not torch.isnan(out_ref_fp32).any()
+    assert torch.isfinite(out_cute).all()
+    assert torch.isfinite(out_ref_fp32).all()
+
+    # Compute numerical tolerance
+    fwd_atol = 2 * (out_ref_fp32 + 0.3 - 0.3 - out_ref_fp32).abs().max().item()
+    rtol = 2
+
+    ref_error = (out_ref - out_ref_fp32).abs().max().item()
+    cute_error = (out_cute - out_ref_fp32).abs().max().item()
+
+    print(
+        f"\n{mask_name} @ Q={seqlen_q}, K={seqlen_k}, H={nheads}/{nheads_kv}, D={headdim}"
+    )
+    print(f"  Reference vs FP32: {ref_error:.2e}")
+    print(f"  Kernel vs FP32: {cute_error:.2e}")
+    print(f"  Tolerance: {fwd_atol:.2e}")
+    print(f"  Error ratio: {cute_error / max(ref_error, 1e-10):.2f}")
+
+    assert cute_error <= rtol * ref_error + fwd_atol, (
+        f"Kernel error {cute_error:.2e} exceeds {rtol}x ref error {ref_error:.2e} + {fwd_atol:.2e}"
+    )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-s"])

@@ -951,10 +951,21 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
     arch = 90
 
-    def __init__(self, *args, intra_wg_overlap: bool = True, mma_pv_is_rs: bool = True, **kwargs):
+    def __init__(
+        self,
+        *args,
+        intra_wg_overlap: bool = True,
+        mma_pv_is_rs: bool = True,
+        mask_mod: Constexpr[Optional[Callable]] = None,
+        use_mask_mod_tensor: Constexpr[Boolean] = False,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.intra_wg_overlap = intra_wg_overlap
         self.mma_pv_is_rs = mma_pv_is_rs
+        self.mask_mod = mask_mod
+        self.use_mask_mod_tensor = use_mask_mod_tensor
+        
 
     def _get_smem_layout_atom(self):
         sQ_layout_atom = warpgroup.make_smem_layout_atom(
@@ -1064,8 +1075,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mV: cute.Tensor,  # (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table
         mO: cute.Tensor,  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
         mLSE: Optional[cute.Tensor],
-        mask_mod: Constexpr[Optional[Callable]],
-        use_mask_mod_tensor: Constexpr[Boolean],
         softmax_scale: Float32,
         stream: cuda.CUstream,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
@@ -1092,8 +1101,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             *(t.element_type if t is not None else None
               for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK))
         )
-        self.mask_mod = mask_mod
-        self.use_mask_mod_tensor = use_mask_mod_tensor
         mMask_mod = mMask_mod if const_expr(self.use_mask_mod_tensor) else None
         # Assume all strides are divisible by 128 bits except the last stride
         new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
@@ -1694,7 +1701,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 # self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block, seqlen=seqlen.seqlen_q,
                 #             headdim=mQ.shape[1])
                 pack_gqa.load_Q(mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q)
-                utils.cp_async_mbarrier_arrive_shared(mbar_ptr_Q, noinc=True)
+                cute.arch.cp_async_mbarrier_arrive_noinc(mbar_ptr_Q)
 
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
             cute.arch.mbarrier_wait(mbar_ptr_Q, phase=q_consumer_phase)
@@ -1948,7 +1955,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     for n_tile in cutlass.range(n_block_max - n_block_min_causal_local_mask, unroll=1):
                         n_block = n_block_max - 1 - n_tile
                         kv_consumer_state = mma_one_n_block(
-                            n_block, kv_consumer_state, mask_fn=partial(mask_fn, mask_seqlen=False),
+                            tidx, m_block, n_block, kv_consumer_state, mask_fn=partial(mask_fn, mask_seqlen=False),
                             O_should_accumulate=O_should_accumulate
                         )
                         O_should_accumulate = True
@@ -1968,6 +1975,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
                         n_block = n_block_max - 1 - n_tile
                         kv_consumer_state = mma_one_n_block(
+                            tidx, m_block,
                             n_block, kv_consumer_state,
                             check_inf=True, mask_fn=partial(mask_fn, mask_seqlen=False),
                             O_should_accumulate=O_should_accumulate
