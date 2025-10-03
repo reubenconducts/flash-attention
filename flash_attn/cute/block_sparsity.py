@@ -16,7 +16,7 @@ def compute_block_sparsity(
 
     n_blocks_k = (config.seqlen_k + config.n_block_size - 1) // config.n_block_size
     n_blocks_q = (config.seqlen_q + config.m_block_size - 1) // config.m_block_size
-    num_heads = config.nheads_kv
+    num_heads = config.nheads
 
     full_block_cnt = torch.zeros(
         (num_heads, config.batch_size, n_blocks_q), device=device, dtype=torch.int32
@@ -73,8 +73,10 @@ def compute_block_sparsity(
         k_starts = k_starts.unsqueeze(0)
         k_ends = k_ends.unsqueeze(0)
 
-        is_full = (k_ends - 1) <= q_starts
-        is_partial = (k_starts <= (q_ends - 1)) & ((k_ends - 1) > q_starts) & ~is_full
+        # Right-aligned causal: account for sequence length offset
+        offset = config.seqlen_k - config.seqlen_q
+        is_full = (k_ends - 1) <= (q_starts + offset)
+        is_partial = (k_starts <= (q_ends - 1 + offset)) & ((k_ends - 1) > (q_starts + offset)) & ~is_full
 
         for q_block in range(n_blocks_q):
             full_indices = k_blocks[is_full[q_block]]
@@ -152,8 +154,8 @@ def compute_block_sparsity(
     # Generic sampling for other patterns
     else:
         qhead_per_kvhead = config.nheads // config.nheads_kv
-        for h_kv in range(num_heads):
-            h_q = h_kv * qhead_per_kvhead
+        for h_q in range(config.nheads):
+            h_kv = h_q // (qhead_per_kvhead)
             for b in range(config.batch_size):
                 for q_block in range(n_blocks_q):
                     q_start = q_block * config.m_block_size
@@ -177,7 +179,7 @@ def compute_block_sparsity(
                         unmasked_count = sum(
                             1
                             for q_pos, k_pos in sample_positions
-                            if mask_mod_flex(b, h_q, q_pos, k_pos)
+                            if mask_mod_flex(b, h_q, q_pos, k_pos, config.seqlen_q, config.seqlen_k)
                         )
 
                         if unmasked_count == len(sample_positions):
@@ -186,14 +188,14 @@ def compute_block_sparsity(
                             partial_blocks.append(k_block)
 
                     if full_blocks:
-                        full_block_cnt[h_kv, b, q_block] = len(full_blocks)
-                        full_block_idx[h_kv, b, q_block, : len(full_blocks)] = torch.tensor(
+                        full_block_cnt[h_q, b, q_block] = len(full_blocks)
+                        full_block_idx[h_q, b, q_block, : len(full_blocks)] = torch.tensor(
                             full_blocks, device=device, dtype=torch.int32
                         )
 
                     if partial_blocks:
-                        mask_block_cnt[h_kv, b, q_block] = len(partial_blocks)
-                        mask_block_idx[h_kv, b, q_block, : len(partial_blocks)] = torch.tensor(
+                        mask_block_cnt[h_q, b, q_block] = len(partial_blocks)
+                        mask_block_idx[h_q, b, q_block, : len(partial_blocks)] = torch.tensor(
                             partial_blocks, device=device, dtype=torch.int32
                         )
 

@@ -7,7 +7,7 @@ import torch
 
 MaskModCallable = Optional[
     Callable[
-        ["cutlass.Int32", "cutlass.Int32", "cutlass.Int32", "cutlass.Int32"],
+        ["cutlass.Int32", "cutlass.Int32", "cutlass.Int32", "cutlass.Int32", "cutlass.Int32", "cutlass.Int32"],
         "cutlass.Boolean",
     ]
 ]
@@ -16,40 +16,49 @@ MaskModCallable = Optional[
 # Flex Attention mask functions (PyTorch signatures for reference implementation)
 
 
-def flex_identity_mask(b, h, q_idx, kv_idx):
+def flex_identity_mask(b, h, q_idx, kv_idx, seqlen_q=None, seqlen_k=None):
     if torch.is_tensor(q_idx):
         return torch.ones_like(q_idx, dtype=torch.bool)
     return True
 
 
-def flex_identity_partial_mask(b, h, q_idx, kv_idx):
+def flex_identity_partial_mask(b, h, q_idx, kv_idx, seqlen_q=None, seqlen_k=None):
     if torch.is_tensor(q_idx):
         return torch.ones_like(q_idx, dtype=torch.bool)
     return True
 
 
-def flex_causal_mask(b, h, q_idx, kv_idx):
+def flex_causal_mask(b, h, q_idx, kv_idx, seqlen_q=None, seqlen_k=None):
+    # Right-aligned causal masking
+    if seqlen_q is not None and seqlen_k is not None:
+        offset = seqlen_k - seqlen_q
+        return kv_idx <= q_idx + offset
     return kv_idx <= q_idx
 
 
-def flex_block_causal_mask(b, h, q_idx, kv_idx):
+def flex_block_causal_mask(b, h, q_idx, kv_idx, seqlen_q=None, seqlen_k=None):
+    # Right-aligned causal masking
+    if seqlen_q is not None and seqlen_k is not None:
+        offset = seqlen_k - seqlen_q
+        return kv_idx <= q_idx + offset
     return kv_idx <= q_idx
 
 
-def flex_sliding_window_mask(b, h, q_idx, kv_idx, window_size=256):
+def flex_sliding_window_mask(b, h, q_idx, kv_idx, seqlen_q=None, seqlen_k=None):
+    window_size = 256
     result = abs(q_idx - kv_idx) <= window_size // 2
     return result
 
 
-def flex_block_diagonal_mask(b, h, q_idx, kv_idx, block_size=64):
+def flex_block_diagonal_mask(b, h, q_idx, kv_idx, seqlen_q=None, seqlen_k=None, block_size=64):
     return (q_idx // block_size) == (kv_idx // block_size)
 
 
-def flex_mini_causal_mask(b, h, q_idx, kv_idx):
+def flex_mini_causal_mask(b, h, q_idx, kv_idx, seqlen_q=None, seqlen_k=None):
     return (q_idx % 128) >= (kv_idx % 128)
 
 
-def flex_half_identity_mask(b, h, q_idx, kv_idx):
+def flex_half_identity_mask(b, h, q_idx, kv_idx, seqlen_q=None, seqlen_k=None):
     """Even k-blocks are full blocks, odd k-blocks are masked blocks (both return True)"""
     if torch.is_tensor(kv_idx):
         return torch.ones_like(kv_idx, dtype=torch.bool)
@@ -61,49 +70,60 @@ def flex_half_identity_mask(b, h, q_idx, kv_idx):
 
 @cute.jit
 def cute_identity_mask(
-    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32
+    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32
 ) -> cutlass.Boolean:
     return cutlass.Boolean(True)
 
 
 @cute.jit
 def cute_identity_partial_mask(
-    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32
+    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32
 ) -> cutlass.Boolean:
     return cutlass.Boolean(True)
 
 
 @cute.jit
 def cute_causal_mask(
-    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32
+    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32
 ) -> cutlass.Boolean:
-    return cutlass.Boolean(n_idx <= m_idx)
+    # Right-aligned causal masking
+    offset = seqlen_k - seqlen_q
+    return cutlass.Boolean(n_idx <= m_idx + offset)
 
 
 @cute.jit
 def cute_block_causal_mask(
-    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32
+    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32
 ) -> cutlass.Boolean:
-    return cutlass.Boolean(n_idx <= m_idx)
+    # Right-aligned causal masking
+    offset = seqlen_k - seqlen_q
+    return cutlass.Boolean(n_idx <= m_idx + offset)
 
 
 @cute.jit
 def cute_sliding_window_mask(
-    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32
+    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32
 ) -> cutlass.Boolean:
     return cutlass.Boolean(m_idx - n_idx <= 128 and m_idx - n_idx >= -128)
 
 
 @cute.jit
 def cute_block_diagonal_mask(
-    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32
+    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32
 ) -> cutlass.Boolean:
     return cutlass.Boolean((m_idx // 64) == (n_idx // 64))
 
 
 @cute.jit
 def cute_mini_causal_mask(
-    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32
+    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32
 ) -> cutlass.Boolean:
     """Each tile is locally causal-masked"""
     m_mod = m_idx % 128
@@ -113,7 +133,8 @@ def cute_mini_causal_mask(
 
 @cute.jit
 def cute_half_identity_mask(
-    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32
+    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32
 ) -> cutlass.Boolean:
     return cutlass.Boolean(True)
 

@@ -184,9 +184,13 @@ def compute_reference(
     scale = 1.0 / math.sqrt(headdim)
 
     if mask_mod_flex is not None:
-        mask_fn = mask_mod_flex
+        # Wrap mask_mod_flex to pass seqlen_q and seqlen_k
+        def mask_fn(b, h, q_idx, kv_idx):
+            return mask_mod_flex(b, h, q_idx, kv_idx, seqlen_q, seqlen_k)
     elif causal:
-        mask_fn = flex_causal_mask
+        # Wrap flex_causal_mask to pass seqlen_q and seqlen_k
+        def mask_fn(b, h, q_idx, kv_idx):
+            return flex_causal_mask(b, h, q_idx, kv_idx, seqlen_q, seqlen_k)
     else:
         mask_fn = None
 
@@ -230,76 +234,119 @@ def compute_reference(
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
+        (1, 1),
         (64, 128),
         (128, 192),
         (256, 256),
+        (239, 1),
+        (799, 3),
         (113, 203),
         (113, 128),
         (128, 217),
+        (113, 211),
+        (108, 256),
         (256, 512),
+        (384, 256),
+        (640, 128),
         (512, 256),
         (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (4096, 4096),
+        (4224, 4224),
     ],
 )
-@pytest.mark.parametrize("nheads,nheads_kv", [(4, 4), (8, 2)])
-@pytest.mark.parametrize("headdim", [128])
+# @pytest.mark.parametrize("nheads", [4, 16, 32, 64])
+@pytest.mark.parametrize("nheads", [4, 16])
+@pytest.mark.parametrize("kv_mode", ["mha", "gqa", "mqa"])
+@pytest.mark.parametrize("headdim", [64, 128])
+# @pytest.mark.parametrize("headdim", [128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
-    "mask_name", ["identity", "causal", "block_causal", "sliding_window"]
+    "use_mask_mod,mask_name",
+    [
+        (False, "identity"),
+        (False, "causal"),
+        (True, "identity"),
+        (True, "causal"),
+        (True, "block_causal"),
+        (True, "sliding_window"),
+    ],
 )
-def test_mask_mod_accuracy(
-    seqlen_q, seqlen_k, nheads, nheads_kv, headdim, dtype, mask_name
+@pytest.mark.parametrize("m_block_size,n_block_size", [(64, 64), (128, 128), (128, 64)])
+def test_mask_mod_output(
+    seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use_mask_mod, mask_name, m_block_size, n_block_size
 ):
     torch.manual_seed(42)
 
+    # Determine nheads_kv based on mode
+    if kv_mode == "mha":
+        nheads_kv = nheads
+    elif kv_mode == "gqa":
+        nheads_kv = nheads // 2
+    elif kv_mode == "mqa":
+        nheads_kv = 1
+    else:
+        raise ValueError(f"Unknown kv_mode: {kv_mode}")
+
     batch_size = 2
     headdim_v = headdim
-    m_block_size = 128
-    n_block_size = 128
 
-    mask_mod_cute, mask_mod_flex = MASK_FUNCTIONS[mask_name]
+    # Determine mask_mod functions and causal flag
+    if use_mask_mod:
+        mask_mod_cute, mask_mod_flex = MASK_FUNCTIONS[mask_name]
+        causal = False
+    else:
+        mask_mod_cute = None
+        mask_mod_flex = None
+        causal = (mask_name == "causal")
+    
+    if causal and seqlen_k < seqlen_q:
+        pytest.skip("causal masking requires seqlen_k >= seqlen_q")
 
     tensors = create_tensors(
         batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim_v, dtype
     )
 
-    # Compute block sparsity
-    from dataclasses import dataclass
+    # Compute block sparsity for mask_mod
+    full_cnt, full_idx, mask_cnt, mask_idx = None, None, None, None
+    if use_mask_mod:
+        from dataclasses import dataclass
 
-    @dataclass
-    class Config:
-        seqlen_q: int
-        seqlen_k: int
-        nheads: int
-        nheads_kv: int
-        batch_size: int
-        m_block_size: int
-        n_block_size: int
-        use_mask_mod: bool
-        mask_mod_name: str
-        verbose: bool = False
+        @dataclass
+        class Config:
+            seqlen_q: int
+            seqlen_k: int
+            nheads: int
+            nheads_kv: int
+            batch_size: int
+            m_block_size: int
+            n_block_size: int
+            use_mask_mod: bool
+            mask_mod_name: str
+            verbose: bool = False
 
-    config = Config(
-        seqlen_q=seqlen_q,
-        seqlen_k=seqlen_k,
-        nheads=nheads,
-        nheads_kv=nheads_kv,
-        batch_size=batch_size,
-        m_block_size=m_block_size,
-        n_block_size=n_block_size,
-        use_mask_mod=True,
-        mask_mod_name=mask_name,
-    )
+        config = Config(
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            nheads=nheads,
+            nheads_kv=nheads_kv,
+            batch_size=batch_size,
+            m_block_size=m_block_size,
+            n_block_size=n_block_size,
+            use_mask_mod=True,
+            mask_mod_name=mask_name,
+        )
 
-    full_cnt, full_idx, mask_cnt, mask_idx = compute_block_sparsity(
-        config=config, mask_mod_flex=mask_mod_flex, device="cuda"
-    )
+        full_cnt, full_idx, mask_cnt, mask_idx = compute_block_sparsity(
+            config=config, mask_mod_flex=mask_mod_flex, device="cuda"
+        )
 
     # Run kernel
     out_cute = compile_and_run_kernel(
         tensors,
         mask_mod_cute,
-        causal=False,
+        causal=causal,
         m_block_size=m_block_size,
         n_block_size=n_block_size,
         full_block_cnt=full_cnt,
@@ -315,9 +362,9 @@ def test_mask_mod_accuracy(
     }
     out_ref_fp32 = compute_reference(
         tensors_fp32,
-        mask_mod_flex,
+        mask_mod_flex if use_mask_mod else None,
         mask_name,
-        causal=False,
+        causal=causal,
         m_block_size=m_block_size,
         n_block_size=n_block_size,
     )
@@ -325,12 +372,30 @@ def test_mask_mod_accuracy(
     # Compute reference at original dtype
     out_ref = compute_reference(
         tensors,
-        mask_mod_flex,
+        mask_mod_flex if use_mask_mod else None,
         mask_name,
-        causal=False,
+        causal=causal,
         m_block_size=m_block_size,
         n_block_size=n_block_size,
     )
+
+    # If using mask_mod causal, also verify against built-in causal
+    if use_mask_mod and mask_name == "causal":
+        out_builtin_causal = compute_reference(
+            tensors_fp32,
+            mask_mod_flex=None,
+            mask_mod_name="causal",
+            causal=True,  # Use built-in causal
+            m_block_size=m_block_size,
+            n_block_size=n_block_size,
+        )
+
+        builtin_causal_error = (out_ref_fp32 - out_builtin_causal).abs().max().item()
+
+        # Verify mask_mod causal matches built-in causal
+        assert builtin_causal_error < 1e-5, (
+            f"mask_mod causal doesn't match built-in causal: error {builtin_causal_error:.2e}"
+        )
 
     # Check for invalid values
     assert out_cute.shape == out_ref_fp32.shape == out_ref.shape
@@ -346,8 +411,10 @@ def test_mask_mod_accuracy(
     ref_error = (out_ref - out_ref_fp32).abs().max().item()
     cute_error = (out_cute - out_ref_fp32).abs().max().item()
 
+    mask_desc = f"mask_mod={mask_name}" if use_mask_mod else mask_name
     print(
-        f"\n{mask_name} @ Q={seqlen_q}, K={seqlen_k}, H={nheads}/{nheads_kv}, D={headdim}"
+        f"\n{mask_desc} @ Q={seqlen_q}, K={seqlen_k}, H={nheads}/{nheads_kv} ({kv_mode}), "
+        f"D={headdim}, M={m_block_size}, N={n_block_size}"
     )
     print(f"  Reference vs FP32: {ref_error:.2e}")
     print(f"  Kernel vs FP32: {cute_error:.2e}")

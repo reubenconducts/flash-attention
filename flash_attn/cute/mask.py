@@ -81,14 +81,34 @@ class AttentionMask:
                     global_col_idx = thr_col_offset + col_idx_local + n_block * self.n_block_size
 
                     if cutlass.const_expr(mask_seqlen):
-                        out_of_bounds = (global_row_idx >= self.seqlen_q) or (global_col_idx >= self.seqlen_k)
+                        out_of_bounds = (global_row_idx >= self.seqlen_q) or (
+                            global_col_idx >= self.seqlen_k
+                        )
                         if out_of_bounds:
                             acc_S_mn[r, col] = -cutlass.Float32.inf
                         else:
-                            cond = cutlass.Boolean(mask_mod(head_idx, batch_idx, global_row_idx, global_col_idx))
+                            cond = cutlass.Boolean(
+                                mask_mod(
+                                    head_idx,
+                                    batch_idx,
+                                    global_row_idx,
+                                    global_col_idx,
+                                    self.seqlen_q,
+                                    self.seqlen_k,
+                                )
+                            )
                             acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
                     else:
-                        cond = cutlass.Boolean(mask_mod(head_idx, batch_idx, global_row_idx, global_col_idx))
+                        cond = cutlass.Boolean(
+                            mask_mod(
+                                head_idx,
+                                batch_idx,
+                                global_row_idx,
+                                global_col_idx,
+                                self.seqlen_q,
+                                self.seqlen_k,
+                            )
+                        )
                         acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
 
 
