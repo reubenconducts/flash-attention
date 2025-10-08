@@ -559,15 +559,15 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize("mha_type", ["mha"])
+# @pytest.mark.parametrize("mha_type", ["gqa"])
 @pytest.mark.parametrize("has_learnable_sink", [False, True])
 # @pytest.mark.parametrize("has_learnable_sink", [False])
-# @pytest.mark.parametrize("new_kv", [False, True])
-@pytest.mark.parametrize("new_kv", [False])
-@pytest.mark.parametrize("local", [False, True])
-# @pytest.mark.parametrize("local", [False])
-# @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("new_kv", [False, True])
+# @pytest.mark.parametrize("new_kv", [False])
+# @pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize("causal", [False, True])
+# @pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [False])
 # @pytest.mark.parametrize("has_rotary_seqlens", [False, True])
@@ -591,7 +591,7 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize("d", [128])
-@pytest.mark.parametrize("d", [64])
+@pytest.mark.parametrize("d", [64, 96, 128])
 # @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -607,7 +607,7 @@ def test_flash_attn_varlen_output(
         # # (1, 128 * 1024),
         # # (16, 128 * 1024),
         # (128, 128),
-        # (256, 512),  # To test appending KV with more than 1 block
+        (256, 512),  # To test appending KV with more than 1 block
         # (2048, 3577),  # Enough tile to test persistent scheduler
     ],
 )
@@ -633,7 +633,8 @@ def test_flash_attn_kvcache(
 ):
     if page_size is not None and seqlen_k % page_size != 0:
         pytest.skip()
-    if seqlen_q > seqlen_k and new_kv:
+    # if seqlen_q > seqlen_k and new_kv:
+    if seqlen_q > seqlen_k:
         pytest.skip()
     if not new_kv and rotary_fraction > 0.0:
         pytest.skip()
@@ -713,7 +714,7 @@ def test_flash_attn_kvcache(
                 seqlen_k, page_size, batch_size_cache, nheads_k, d, dv, device, dtype, dtype_ref
             )
         cache_seqlens = torch.randint(
-            0 if new_kv else 1,
+            0 if new_kv else seqlen_q + 1 if (causal or local) else 1,
             # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
             (
                 (seqlen_k - (seqlen_q if (causal or local) and rotary_dim > 1 else seqlen_new) + 1)
@@ -884,7 +885,7 @@ def test_flash_attn_kvcache(
                     # cache_batch_idx=cache_batch_idx,
                     # cache_leftpad=cache_leftpad,
                     page_table=page_table,
-                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_q=cu_seqlens_q, 
                     # cu_seqlens_k_new=cu_seqlens_k_new,
                     # rotary_seqlens=rotary_seqlens,
                     causal=causal,

@@ -1,5 +1,8 @@
 from typing import Callable, Optional
 
+import random
+import math 
+
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -64,6 +67,8 @@ def flex_half_identity_mask(b, h, q_idx, kv_idx, seqlen_q=None, seqlen_k=None):
         return torch.ones_like(kv_idx, dtype=torch.bool)
     return True
 
+def flex_document_mask(b, h, q_idx, kv_idx, doc_id: torch.Tensor):
+    return doc_id[q_idx] == doc_id[kv_idx]
 
 # CuTe versions for kernel compilation
 
@@ -71,7 +76,7 @@ def flex_half_identity_mask(b, h, q_idx, kv_idx, seqlen_q=None, seqlen_k=None):
 @cute.jit
 def cute_identity_mask(
     head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
-    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers: None,
 ) -> cutlass.Boolean:
     return cutlass.Boolean(True)
 
@@ -79,7 +84,7 @@ def cute_identity_mask(
 @cute.jit
 def cute_identity_partial_mask(
     head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
-    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers: None,
 ) -> cutlass.Boolean:
     return cutlass.Boolean(True)
 
@@ -87,7 +92,7 @@ def cute_identity_partial_mask(
 @cute.jit
 def cute_causal_mask(
     head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
-    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers: None,
 ) -> cutlass.Boolean:
     # Right-aligned causal masking
     offset = seqlen_k - seqlen_q
@@ -97,7 +102,7 @@ def cute_causal_mask(
 @cute.jit
 def cute_block_causal_mask(
     head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
-    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers: None,
 ) -> cutlass.Boolean:
     # Right-aligned causal masking
     offset = seqlen_k - seqlen_q
@@ -111,6 +116,14 @@ def cute_sliding_window_mask(
 ) -> cutlass.Boolean:
     return cutlass.Boolean(m_idx - n_idx <= 128 and m_idx - n_idx >= -128)
 
+
+@cute.jit
+def cute_document_mask(
+    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32, seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers: list[cute.Tensor],
+):
+    doc_id = buffers[0]
+    return cutlass.Boolean(doc_id[head, batch, m_idx] == doc_id[head, batch, n_idx])
+    
 
 @cute.jit
 def cute_block_diagonal_mask(
@@ -139,6 +152,24 @@ def cute_half_identity_mask(
     return cutlass.Boolean(True)
 
 
+def random_doc_id_tensor(nheads, batch, seqlen_q, device="cpu"):
+    doc_ids_tensor = torch.zeros(batch, nheads, seqlen_q, dtype=torch.int32, device=device)
+    for b in range(batch):
+        for h in range(nheads):
+            N = seqlen_q
+            n = random.randint(1, math.ceil(math.sqrt(N // 4)))
+            cuts = sorted(random.sample(range(1, N), n-1))
+            lengths = [b - a for a, b in zip((0, *cuts), (*cuts, N))]
+
+            doc_ids = []
+            for i, length in enumerate(lengths):
+                doc_ids += [i for _ in range(length)]
+            
+            doc_ids_tensor[b, h, :] = torch.tensor(doc_ids, dtype=torch.int32, device=device)
+    print(f"{doc_ids_tensor.shape = }")
+    return doc_ids_tensor
+    
+
 MASK_FUNCTIONS = {
     "identity": (cute_identity_mask, flex_identity_mask),
     "identity_partial": (cute_identity_partial_mask, flex_identity_partial_mask),
@@ -148,4 +179,9 @@ MASK_FUNCTIONS = {
     "block_diagonal": (cute_block_diagonal_mask, flex_block_diagonal_mask),
     "mini_causal": (cute_mini_causal_mask, flex_mini_causal_mask),
     "half_identity": (cute_half_identity_mask, flex_half_identity_mask),
+    "document": (cute_document_mask, flex_document_mask),
 }
+
+if __name__ == "__main__":
+    doc_ids = random_doc_id_tensor(1, 2, 128)
+    print(f"{doc_ids = }")

@@ -7,7 +7,7 @@
 
 import math
 from types import SimpleNamespace
-from typing import Type, Callable, Optional, Tuple
+from typing import Type, Callable, Optional, Tuple, List
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -50,6 +50,8 @@ class FlashAttentionForwardBase:
         num_stages: int = 1,
         num_threads: int = 128,
         Q_in_regs: bool = False,
+        mask_mod: Optional[cutlass.Constexpr] = None,
+        has_buffers: bool = False,
     ):
         """Initializes the configuration for a flash attention kernel.
 
@@ -85,6 +87,7 @@ class FlashAttentionForwardBase:
         self.num_threads = num_threads
         self.num_stages = num_stages
         self.Q_in_regs = Q_in_regs
+        
 
     @staticmethod
     def can_implement(
@@ -957,14 +960,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         intra_wg_overlap: bool = True,
         mma_pv_is_rs: bool = True,
         mask_mod: Constexpr[Optional[Callable]] = None,
-        use_mask_mod_tensor: Constexpr[Boolean] = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.intra_wg_overlap = intra_wg_overlap
         self.mma_pv_is_rs = mma_pv_is_rs
         self.mask_mod = mask_mod
-        self.use_mask_mod_tensor = use_mask_mod_tensor
         
 
     def _get_smem_layout_atom(self):
@@ -1090,18 +1091,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         full_block_idx: Optional[cute.Tensor] = None,  # (b, h, m_block, n_block)
         mask_block_cnt: Optional[cute.Tensor] = None,  # (b, h, m_block)
         mask_block_idx: Optional[cute.Tensor] = None,  # (b, h, m_block, n_block)
-        mMask_mod: Optional[cute.Tensor] = None,
+        buffers: Optional[list] = None,
     ):
         """Configures and launches the flash attention kernel.
 
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
+
         self._check_type(
             *(t.element_type if t is not None else None
               for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK))
         )
-        mMask_mod = mMask_mod if const_expr(self.use_mask_mod_tensor) else None
+
         # Assume all strides are divisible by 128 bits except the last stride
         new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
 
@@ -1249,7 +1251,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             full_block_idx,
             mask_block_cnt,
             mask_block_idx,
-            mMask_mod,
             self.sQ_layout,
             self.sK_layout,
             self.sV_layout,
@@ -1265,6 +1266,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tile_sched_params,
             TileScheduler,
             SharedStorage,
+            buffers,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -1298,7 +1300,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         full_block_idx: Optional[cute.Tensor],
         mask_block_cnt: Optional[cute.Tensor],
         mask_block_idx: Optional[cute.Tensor],
-        mMask_mod: Optional[cute.Tensor],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
@@ -1314,6 +1315,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
         SharedStorage: cutlass.Constexpr[Callable],
+        buffers: Optional[list],
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Prefetch tma descriptor
@@ -1448,7 +1450,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 full_block_idx,
                 mask_block_cnt,
                 mask_block_idx,
-                mMask_mod,
                 gmem_tiled_copy_Q,
                 gmem_tiled_copy_O,
                 tma_atom_O,
@@ -1459,6 +1460,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 SeqlenInfoCls,
                 AttentionMaskCls,
                 TileSchedulerCls,
+                buffers,
             )
 
     @cute.jit
@@ -1596,7 +1598,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         full_block_idx: Optional[cute.Tensor],
         mask_block_cnt: Optional[cute.Tensor],
         mask_block_idx: Optional[cute.Tensor],
-        mMask_mod: Optional[cute.Tensor],
         gmem_tiled_copy_Q: cute.TiledCopy,
         gmem_tiled_copy_O: cute.TiledCopy,
         tma_atom_O: Optional[cute.CopyAtom],
@@ -1607,6 +1608,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         SeqlenInfoCls: Callable,
         AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
+        buffers: Optional[list[cute.Tensor]],
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         warp_group_thread_layout = cute.make_layout(
@@ -1686,6 +1688,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 thr_mma=thr_mma_qk,
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
+                buffers=buffers,
             )
             softmax.reset()
             # Load Q if not TMA_Q
@@ -1751,7 +1754,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             tidx,
                             scoremod_premask_fn,
                             partial(mask_fn, mask_mod=self.mask_mod),
-                            mMask_mod,
                             is_first_block=True,
                             mask_seqlen=True,
                             mma_params=mma_params,
@@ -1817,10 +1819,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     curr_full_block_idx = full_block_idx[head_idx, batch_idx, m_block, None]
                     if const_expr(self.intra_wg_overlap):
                         # Overlap mode: manually handle first block
-                        # acc_S = cute.make_fragment(
-                        #     tiled_mma_qk.partition_shape_C((self.m_block_size, self.n_block_size)),
-                        #     Float32,
-                        # )
                         start_loop_at = 0
                         if curr_mask_block_cnt == 0:
                             full_n_block = curr_full_block_idx[curr_full_block_cnt - 1]
@@ -1836,7 +1834,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                 tidx,
                                 scoremod_premask_fn,
                                 partial(mask_fn, mask_mod=None),
-                                mMask_mod,
                                 is_first_block=True,
                                 mask_seqlen=True,
                                 mma_params=mma_params,
@@ -1912,10 +1909,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 # ===============================================================================================
                 # First iteration with seqlen masking
                 if const_expr(self.intra_wg_overlap):
-                    # acc_S = cute.make_fragment(
-                    #     tiled_mma_qk.partition_shape_C((self.m_block_size, self.n_block_size)),
-                    #     Float32,
-                    # )
                     kv_consumer_state = self.first_half_block_overlap(
                         acc_S,
                         m_block,
@@ -1928,7 +1921,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         tidx,
                         scoremod_premask_fn,
                         partial(mask_fn, mask_mod=None),
-                        mMask_mod,
                         is_first_block=True,
                         mask_seqlen=True,
                         mma_params=mma_params,
@@ -2037,7 +2029,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tidx: Int32,
         scoremod_premask_fn: Callable,
         mask_fn: Callable,
-        mMask_mod: Optional[cute.Tensor],
         is_first_block: bool,
         mask_seqlen: bool,
         mma_params,
@@ -2122,7 +2113,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         softmax: Softmax,
         scoremod_premask_fn: Callable,
         mask_fn: Optional[Callable] = None,
-        mMask_mod: Optional[cute.Tensor] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
         O_should_accumulate: cutlass.Boolean = True,
@@ -2184,7 +2174,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         softmax: Softmax,
         scoremod_premask_fn: Callable,
         mask_fn: Optional[Callable] = None,
-        mMask_mod: Optional[cute.Tensor] = None,
         check_inf: cutlass.Constexpr = True,
         O_should_accumulate: cutlass.Boolean = True,
     ):

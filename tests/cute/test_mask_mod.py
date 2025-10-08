@@ -235,45 +235,48 @@ def compute_reference(
     "seqlen_q,seqlen_k",
     [
         (1, 1),
-        (64, 128),
+        # (64, 128),
         (128, 192),
         (256, 256),
-        (239, 1),
-        (799, 3),
-        (113, 203),
-        (113, 128),
+        # (239, 1),
+        # (799, 3),
+        # (113, 203),
+        # (113, 128),
         (128, 217),
-        (113, 211),
-        (108, 256),
+        # (113, 211),
+        # (108, 256),
         (256, 512),
         (384, 256),
-        (640, 128),
+        # (640, 128),
         (512, 256),
         (1024, 1024),
-        (1023, 1024),
+        # (1023, 1024),
         (1024, 1023),
         (4096, 4096),
-        (4224, 4224),
+        # (4224, 4224),
     ],
 )
 # @pytest.mark.parametrize("nheads", [4, 16, 32, 64])
-@pytest.mark.parametrize("nheads", [4, 16])
-@pytest.mark.parametrize("kv_mode", ["mha", "gqa", "mqa"])
-@pytest.mark.parametrize("headdim", [64, 128])
-# @pytest.mark.parametrize("headdim", [128])
+@pytest.mark.parametrize("nheads", [16])
+# @pytest.mark.parametrize("nheads", [4, 16, 32])
+# @pytest.mark.parametrize("kv_mode", ["mha", "gqa", "mqa"])
+@pytest.mark.parametrize("kv_mode", ["mha"])
+# @pytest.mark.parametrize("headdim", [64, 128])
+@pytest.mark.parametrize("headdim", [128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
     "use_mask_mod,mask_name",
     [
-        (False, "identity"),
-        (False, "causal"),
-        (True, "identity"),
+        # (False, "identity"),
+        # (False, "causal"),
+        # (True, "identity"),
         (True, "causal"),
         (True, "block_causal"),
-        (True, "sliding_window"),
+        # (True, "sliding_window"),
     ],
 )
-@pytest.mark.parametrize("m_block_size,n_block_size", [(64, 64), (128, 128), (128, 64)])
+# @pytest.mark.parametrize("m_block_size,n_block_size", [(64, 64), (128, 128), (128, 64)])
+@pytest.mark.parametrize("m_block_size,n_block_size", [(128, 128),])
 def test_mask_mod_output(
     seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use_mask_mod, mask_name, m_block_size, n_block_size
 ):

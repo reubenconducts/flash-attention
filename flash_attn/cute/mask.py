@@ -33,6 +33,7 @@ class AttentionMask:
         mask_causal: cutlass.Constexpr[bool],
         mask_local: cutlass.Constexpr[bool] = False,
         mask_mod: Optional[Callable] = None,
+        buffers: Optional[list[cute.Tensor]] = None,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_S_mn = utils.make_acc_tensor_mn_view(acc_S)
@@ -69,17 +70,17 @@ class AttentionMask:
         elif cutlass.const_expr(not mask_causal and not mask_local and mask_mod is not None):
             nrow = cutlass.const_expr(cute.size(tScS_mn.shape[0]))
             ncol = cutlass.const_expr(cute.size(tScS_mn.shape[1]))
-
             thr_col_offset = tScS_mn[0, 0][1]
-
-            for r in cutlass.range(nrow, unroll_full=True):
+            
+            # Use range_constexpr for guaranteed complete unrolling (zero loop overhead)
+            for r in cutlass.range_constexpr(nrow):
                 global_row_idx = tScS_mn[r, 0][0] + m_block * self.m_block_size
-
-                for col in cutlass.range(ncol, unroll_full=True):
+                
+                for col in cutlass.range_constexpr(ncol):
                     col_idx_local = t0ScS_mn[0, col][1]
                     # Convert to absolute column index
                     global_col_idx = thr_col_offset + col_idx_local + n_block * self.n_block_size
-
+                    
                     if cutlass.const_expr(mask_seqlen):
                         out_of_bounds = (global_row_idx >= self.seqlen_q) or (
                             global_col_idx >= self.seqlen_k
@@ -91,10 +92,11 @@ class AttentionMask:
                                 mask_mod(
                                     head_idx,
                                     batch_idx,
-                                    global_row_idx,
-                                    global_col_idx,
+                                    tScS_mn[r, 0][0] + m_block * self.m_block_size,
+                                    thr_col_offset + t0ScS_mn[0, col][1] + n_block * self.n_block_size,
                                     self.seqlen_q,
                                     self.seqlen_k,
+                                    buffers,
                                 )
                             )
                             acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
@@ -103,10 +105,11 @@ class AttentionMask:
                             mask_mod(
                                 head_idx,
                                 batch_idx,
-                                global_row_idx,
-                                global_col_idx,
+                                tScS_mn[r, 0][0] + m_block * self.m_block_size,
+                                thr_col_offset + t0ScS_mn[0, col][1] + n_block * self.n_block_size,
                                 self.seqlen_q,
                                 self.seqlen_k,
+                                buffers,
                             )
                         )
                         acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
