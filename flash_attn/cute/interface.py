@@ -66,13 +66,6 @@ def _flash_attn_fwd(
     window_size_left: Optional[int] = None,
     window_size_right: Optional[int] = None,
     learnable_sink: Optional[torch.Tensor] = None,
-    mask_mod: Optional[Callable] = None,
-    use_mask_mod_tensor: bool = False,
-    full_block_cnt: Optional[torch.Tensor] = None,
-    full_block_idx: Optional[torch.Tensor] = None,
-    mask_block_cnt: Optional[torch.Tensor] = None,
-    mask_block_idx: Optional[torch.Tensor] = None,
-    mask_mod_tensor: Optional[torch.Tensor] = None,
     # m_block_size: int = 128,
     # n_block_size: int = 64,
     # num_threads: int = 128,
@@ -82,6 +75,11 @@ def _flash_attn_fwd(
     pack_gqa: Optional[bool] = None,
     _compute_capability: Optional[int] = None,
     score_mod: Callable | None = None,
+    mask_mod: Optional[Callable] = None,
+    full_block_cnt: Optional[torch.Tensor] = None,
+    full_block_idx: Optional[torch.Tensor] = None,
+    mask_block_cnt: Optional[torch.Tensor] = None,
+    mask_block_idx: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
@@ -147,7 +145,6 @@ def _flash_attn_fwd(
         if t is not None:
             assert t.dtype == torch.int32, "blocksparse mask tensors must be int32"
             assert t.stride(0) == 1, "blocksparse mask tensors must be contiguous"
-    assert mask_mod_tensor is None, "no support for mask_mod_tensor yet"
     assert all(
         t is None or t.is_cuda
         for t in (
@@ -158,7 +155,6 @@ def _flash_attn_fwd(
             learnable_sink,
             full_block_cnt, full_block_idx,
             mask_block_cnt, mask_block_idx,
-            mask_mod_tensor,
         )
     ), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
@@ -213,7 +209,7 @@ def _flash_attn_fwd(
     full_block_idx_tensor = from_dlpack(full_block_idx.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=3) if full_block_idx is not None else None
     mask_block_cnt_tensor = from_dlpack(mask_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=2) if mask_block_cnt is not None else None
     mask_block_idx_tensor = from_dlpack(mask_block_idx.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=3) if mask_block_idx is not None else None
-    mask_mod_tensor_cute = from_dlpack(mask_mod_tensor.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0) if mask_mod_tensor is not None else None
+
     
     if causal:
         window_size_right = 0
@@ -234,7 +230,7 @@ def _flash_attn_fwd(
         # TODO: fix the varlen case
         if pack_gqa and (128 % qhead_per_kvhead != 0) or (cu_seqlens_q is not None or seqused_q is not None):
             pack_gqa = False
-    mask_mod_hash = utils.hash_callable(mask_mod)
+    mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else None
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
         score_mod = utils.create_softcap_scoremod(softcap)
@@ -258,7 +254,6 @@ def _flash_attn_fwd(
         window_size_left is not None, window_size_right is not None,
         learnable_sink is not None,
         m_block_size, n_block_size, num_threads, pack_gqa,
-        mask_mod_hash, use_mask_mod_tensor,
         compute_capability,
     )
 
@@ -280,10 +275,9 @@ def _flash_attn_fwd(
                 num_stages=2,
                 num_threads=num_threads,
                 Q_in_regs=False,
-                intra_wg_overlap=True,
+                intra_wg_overlap=False,
                 mma_pv_is_rs=True,
                 mask_mod=mask_mod,
-                use_mask_mod_tensor=use_mask_mod_tensor,
                 score_mod=score_mod,
                 has_buffers=buffers is not None,
             )
@@ -307,16 +301,18 @@ def _flash_attn_fwd(
             fa_fwd, q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
             cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
             page_table_tensor,
-            window_size_left, window_size_right, learnable_sink_tensor, cute_buffers,
+            window_size_left, window_size_right, learnable_sink_tensor,
             full_block_cnt_tensor, full_block_idx_tensor, mask_block_cnt_tensor, mask_block_idx_tensor,
-            mask_mod_tensor_cute,
+            cute_buffers,
         )
     else:
         _flash_attn_fwd.compile_cache[compile_key](
             q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
             cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
             page_table_tensor,
-            softcap, window_size_left, window_size_right, learnable_sink_tensor,
+            window_size_left, window_size_right, learnable_sink_tensor,
+            full_block_cnt_tensor, full_block_idx_tensor, mask_block_cnt_tensor, mask_block_idx_tensor,
+            cute_buffers,
         )
     return out, lse
 
@@ -522,12 +518,10 @@ class FlashAttnFunc(torch.autograd.Function):
         softcap: float = 0.0,
         pack_gqa: Optional[bool] = None,
         mask_mod: Optional[Callable] = None,
-        use_mask_mod_tensor: bool = False,
         full_block_cnt: Optional[torch.Tensor] = None,
         full_block_idx: Optional[torch.Tensor] = None,
         mask_block_cnt: Optional[torch.Tensor] = None,
         mask_block_idx: Optional[torch.Tensor] = None,
-        mask_mod_tensor: Optional[torch.Tensor] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -541,12 +535,10 @@ class FlashAttnFunc(torch.autograd.Function):
             softcap=softcap,
             pack_gqa=pack_gqa,
             mask_mod=mask_mod,
-            use_mask_mod_tensor=use_mask_mod_tensor,
             full_block_cnt=full_block_cnt,
             full_block_idx=full_block_idx,
             mask_block_cnt=mask_block_cnt,
             mask_block_idx=mask_block_idx,
-            mask_mod_tensor=mask_mod_tensor,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
@@ -635,12 +627,10 @@ def flash_attn_func(
     softcap: float = 0.0,
     pack_gqa: Optional[bool] = None,
     mask_mod: Optional[Callable] = None,
-    use_mask_mod_tensor: bool = False,
     full_block_cnt: Optional[torch.Tensor] = None,
     full_block_idx: Optional[torch.Tensor] = None,
     mask_block_cnt: Optional[torch.Tensor] = None,
     mask_block_idx: Optional[torch.Tensor] = None,
-    mask_mod_tensor: Optional[torch.Tensor] = None,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -653,12 +643,10 @@ def flash_attn_func(
         softcap,
         pack_gqa,
         mask_mod,
-        use_mask_mod_tensor,
         full_block_cnt,
         full_block_idx,
         mask_block_cnt,
         mask_block_idx,
-        mask_mod_tensor,
     )
 
 

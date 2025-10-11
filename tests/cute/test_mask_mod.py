@@ -89,7 +89,7 @@ def compile_and_run_kernel(
         intra_wg_overlap=True,
         mma_pv_is_rs=True,
         mask_mod=mask_mod_cute,
-        use_mask_mod_tensor=False,
+        has_buffers=False,
         Q_in_regs=False,
     )
 
@@ -259,16 +259,16 @@ def compute_reference(
 # @pytest.mark.parametrize("nheads", [4, 16, 32, 64])
 @pytest.mark.parametrize("nheads", [16])
 # @pytest.mark.parametrize("nheads", [4, 16, 32])
-# @pytest.mark.parametrize("kv_mode", ["mha", "gqa", "mqa"])
-@pytest.mark.parametrize("kv_mode", ["mha"])
+@pytest.mark.parametrize("kv_mode", ["mha", "gqa", "mqa"])
+# @pytest.mark.parametrize("kv_mode", ["mha"])
 # @pytest.mark.parametrize("headdim", [64, 128])
 @pytest.mark.parametrize("headdim", [128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
     "use_mask_mod,mask_name",
     [
-        # (False, "identity"),
-        # (False, "causal"),
+        (False, "identity"),
+        (False, "causal"),
         # (True, "identity"),
         (True, "causal"),
         (True, "block_causal"),
