@@ -24,8 +24,8 @@ class AttentionMask:
     def apply_mask(
         self,
         acc_S: cute.Tensor,
-        head_idx: cutlass.Int32,
         batch_idx: cutlass.Int32,
+        head_idx: cutlass.Int32,
         m_block: cutlass.Int32,
         n_block: cutlass.Int32,
         thr_mma: cute.TiledMma,
@@ -81,6 +81,17 @@ class AttentionMask:
                     # Convert to absolute column index
                     global_col_idx = thr_col_offset + col_idx_local + n_block * self.n_block_size
                     
+                    cond = cutlass.Boolean(
+                        mask_mod(
+                            batch_idx,
+                            head_idx,
+                            tScS_mn[r, 0][0] + m_block * self.m_block_size,
+                            thr_col_offset + t0ScS_mn[0, col][1] + n_block * self.n_block_size,
+                            self.seqlen_q,
+                            self.seqlen_k,
+                            buffers,
+                        )
+                    )
                     if cutlass.const_expr(mask_seqlen):
                         out_of_bounds = (global_row_idx >= self.seqlen_q) or (
                             global_col_idx >= self.seqlen_k
@@ -88,30 +99,8 @@ class AttentionMask:
                         if out_of_bounds:
                             acc_S_mn[r, col] = -cutlass.Float32.inf
                         else:
-                            cond = cutlass.Boolean(
-                                mask_mod(
-                                    head_idx,
-                                    batch_idx,
-                                    tScS_mn[r, 0][0] + m_block * self.m_block_size,
-                                    thr_col_offset + t0ScS_mn[0, col][1] + n_block * self.n_block_size,
-                                    self.seqlen_q,
-                                    self.seqlen_k,
-                                    buffers,
-                                )
-                            )
                             acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
                     else:
-                        cond = cutlass.Boolean(
-                            mask_mod(
-                                head_idx,
-                                batch_idx,
-                                tScS_mn[r, 0][0] + m_block * self.m_block_size,
-                                thr_col_offset + t0ScS_mn[0, col][1] + n_block * self.n_block_size,
-                                self.seqlen_q,
-                                self.seqlen_k,
-                                buffers,
-                            )
-                        )
                         acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
 
 

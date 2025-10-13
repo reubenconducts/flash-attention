@@ -68,14 +68,14 @@ def flex_half_identity_mask(b, h, q_idx, kv_idx, seqlen_q=None, seqlen_k=None):
     return True
 
 def flex_document_mask(b, h, q_idx, kv_idx, doc_id: torch.Tensor):
-    return doc_id[q_idx] == doc_id[kv_idx]
+    return doc_id[b, h, q_idx] == doc_id[b, h, kv_idx]
 
 # CuTe versions for kernel compilation
 
 
 @cute.jit
 def cute_identity_mask(
-    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
+    batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
     seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers: None,
 ) -> cutlass.Boolean:
     return cutlass.Boolean(True)
@@ -83,7 +83,7 @@ def cute_identity_mask(
 
 @cute.jit
 def cute_identity_partial_mask(
-    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
+    batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
     seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers: None,
 ) -> cutlass.Boolean:
     return cutlass.Boolean(True)
@@ -91,7 +91,7 @@ def cute_identity_partial_mask(
 
 @cute.jit
 def cute_causal_mask(
-    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
+    batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
     seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers: None,
 ) -> cutlass.Boolean:
     # Right-aligned causal masking
@@ -101,7 +101,7 @@ def cute_causal_mask(
 
 @cute.jit
 def cute_block_causal_mask(
-    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
+    batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
     seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers: None,
 ) -> cutlass.Boolean:
     # Right-aligned causal masking
@@ -111,7 +111,7 @@ def cute_block_causal_mask(
 
 @cute.jit
 def cute_sliding_window_mask(
-    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
+    batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
     seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32
 ) -> cutlass.Boolean:
     return cutlass.Boolean(m_idx - n_idx <= 128 and m_idx - n_idx >= -128)
@@ -119,15 +119,15 @@ def cute_sliding_window_mask(
 
 @cute.jit
 def cute_document_mask(
-    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32, seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers: list[cute.Tensor],
+    batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32, seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers: list[cute.Tensor],
 ):
     doc_id = buffers[0]
-    return cutlass.Boolean(doc_id[head, batch, m_idx] == doc_id[head, batch, n_idx])
+    return cutlass.Boolean(doc_id[batch, head, m_idx] == doc_id[batch, head, n_idx])
     
 
 @cute.jit
 def cute_block_diagonal_mask(
-    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
+    batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
     seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32
 ) -> cutlass.Boolean:
     return cutlass.Boolean((m_idx // 64) == (n_idx // 64))
@@ -135,7 +135,7 @@ def cute_block_diagonal_mask(
 
 @cute.jit
 def cute_mini_causal_mask(
-    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
+    batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
     seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32
 ) -> cutlass.Boolean:
     """Each tile is locally causal-masked"""
@@ -146,7 +146,7 @@ def cute_mini_causal_mask(
 
 @cute.jit
 def cute_half_identity_mask(
-    head: cutlass.Int32, batch: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
+    batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
     seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32
 ) -> cutlass.Boolean:
     return cutlass.Boolean(True)

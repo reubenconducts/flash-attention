@@ -46,22 +46,21 @@ def compute_block_sparsity(
             n_blocks_q = (seq_len_q + config.m_block_size - 1) // config.m_block_size
             max_m_blocks = max(max_m_blocks, n_blocks_q)
         
-        # Allocate padded tensors
-        # Note: max n_blocks computed from total concatenated length
+        # Allocate padded tensors with (batch, head, ...) ordering
         total_k = cu_seqlens_k[-1].item()
         max_n_blocks = (total_k + config.n_block_size - 1) // config.n_block_size
         
         full_block_cnt = torch.zeros(
-            (num_heads, config.batch_size, max_m_blocks), device=device, dtype=torch.int32
+            (config.batch_size, num_heads, max_m_blocks), device=device, dtype=torch.int32
         )
         mask_block_cnt = torch.zeros(
-            (num_heads, config.batch_size, max_m_blocks), device=device, dtype=torch.int32
+            (config.batch_size, num_heads, max_m_blocks), device=device, dtype=torch.int32
         )
         full_block_idx = torch.zeros(
-            (num_heads, config.batch_size, max_m_blocks, max_n_blocks), device=device, dtype=torch.int32
+            (config.batch_size, num_heads, max_m_blocks, max_n_blocks), device=device, dtype=torch.int32
         )
         mask_block_idx = torch.zeros(
-            (num_heads, config.batch_size, max_m_blocks, max_n_blocks), device=device, dtype=torch.int32
+            (config.batch_size, num_heads, max_m_blocks, max_n_blocks), device=device, dtype=torch.int32
         )
         
         # Process each sequence
@@ -110,24 +109,23 @@ def compute_block_sparsity(
         return full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx
     
     else:
-        # Non-varlen: use existing logic
+        # Non-varlen: use (batch, head, ...) ordering
         n_blocks_k = (config.seqlen_k + config.n_block_size - 1) // config.n_block_size
         n_blocks_q = (config.seqlen_q + config.m_block_size - 1) // config.m_block_size
 
         full_block_cnt = torch.zeros(
-            (num_heads, config.batch_size, n_blocks_q), device=device, dtype=torch.int32
+            (config.batch_size, num_heads, n_blocks_q), device=device, dtype=torch.int32
         )
         mask_block_cnt = torch.zeros(
-            (num_heads, config.batch_size, n_blocks_q), device=device, dtype=torch.int32
+            (config.batch_size, num_heads, n_blocks_q), device=device, dtype=torch.int32
         )
         full_block_idx = torch.zeros(
-            (num_heads, config.batch_size, n_blocks_q, n_blocks_k), device=device, dtype=torch.int32
+            (config.batch_size, num_heads, n_blocks_q, n_blocks_k), device=device, dtype=torch.int32
         )
         mask_block_idx = torch.zeros(
-            (num_heads, config.batch_size, n_blocks_q, n_blocks_k), device=device, dtype=torch.int32
+            (config.batch_size, num_heads, n_blocks_q, n_blocks_k), device=device, dtype=torch.int32
         )
 
-        # [Keep all existing non-varlen logic unchanged]
         if config.mask_mod_name == "identity":
             k_blocks = torch.arange(n_blocks_k, device=device)
             for q_block in range(n_blocks_q):
@@ -183,38 +181,36 @@ def compute_block_sparsity(
                     mask_block_idx[:, :, q_block, : len(partial_indices)] = partial_indices
 
         elif config.mask_mod_name == "document":
-            # Assuming doc_ids tensor is available as input
-            # doc_ids shape: (nheads, batch_size, seqlen_q)
-            # Note: This assumes doc_ids is passed in or available in config
+            # doc_ids shape: (batch_size, nheads, seqlen_q)
             doc_ids = buffers[0]
-            for h in range(num_heads):
-                for b in range(config.batch_size):
+            for b in range(config.batch_size):
+                for h in range(num_heads):
                     for q_block in range(n_blocks_q):
                         q_start = q_block * config.m_block_size
                         q_end = min((q_block + 1) * config.m_block_size, config.seqlen_q) - 1
                         
                         # Since monotone non-decreasing, just check corners
-                        doc_q_start = doc_ids[h, b, q_start]
-                        doc_q_end = doc_ids[h, b, q_end]
+                        doc_q_start = doc_ids[b, h, q_start]
+                        doc_q_end = doc_ids[b, h, q_end]
                         
                         for k_block in range(n_blocks_k):
                             k_start = k_block * config.n_block_size
                             k_end = min((k_block + 1) * config.n_block_size, config.seqlen_k) - 1
                             
-                            doc_k_start = doc_ids[h, b, k_start]
-                            doc_k_end = doc_ids[h, b, k_end]
+                            doc_k_start = doc_ids[b, h, k_start]
+                            doc_k_end = doc_ids[b, h, k_end]
                             
                             # Check if all four corners are in the same document
                             if doc_q_start == doc_q_end == doc_k_start == doc_k_end:
                                 # Fully computed block
-                                cnt = full_block_cnt[h, b, q_block].item()
-                                full_block_idx[h, b, q_block, cnt] = k_block
-                                full_block_cnt[h, b, q_block] += 1
+                                cnt = full_block_cnt[b, h, q_block].item()
+                                full_block_idx[b, h, q_block, cnt] = k_block
+                                full_block_cnt[b, h, q_block] += 1
                             elif not (doc_q_start == doc_q_end and doc_k_start == doc_k_end and doc_q_start != doc_k_start):
                                 # Partially masked block (some corners match, some don't)
-                                cnt = mask_block_cnt[h, b, q_block].item()
-                                mask_block_idx[h, b, q_block, cnt] = k_block
-                                mask_block_cnt[h, b, q_block] += 1
+                                cnt = mask_block_cnt[b, h, q_block].item()
+                                mask_block_idx[b, h, q_block, cnt] = k_block
+                                mask_block_cnt[b, h, q_block] += 1
                             # else: fully masked block (all q in one doc, all k in different doc) - skip
 
         return full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx
@@ -263,14 +259,14 @@ def _compute_causal_varlen_blocks(
                 partial_blocks.append(n_block_global)
         
         if full_blocks:
-            full_block_cnt[:, seq_idx, m_local] = len(full_blocks)
-            full_block_idx[:, seq_idx, m_local, :len(full_blocks)] = torch.tensor(
+            full_block_cnt[seq_idx, :, m_local] = len(full_blocks)
+            full_block_idx[seq_idx, :, m_local, :len(full_blocks)] = torch.tensor(
                 full_blocks, device=device, dtype=torch.int32
             )
         
         if partial_blocks:
-            mask_block_cnt[:, seq_idx, m_local] = len(partial_blocks)
-            mask_block_idx[:, seq_idx, m_local, :len(partial_blocks)] = torch.tensor(
+            mask_block_cnt[seq_idx, :, m_local] = len(partial_blocks)
+            mask_block_idx[seq_idx, :, m_local, :len(partial_blocks)] = torch.tensor(
                 partial_blocks, device=device, dtype=torch.int32
             )
 
@@ -287,8 +283,8 @@ def _compute_identity_varlen_blocks(
     )
     
     for m_local in range(n_blocks_q):
-        full_block_cnt[:, seq_idx, m_local] = n_blocks_k
-        full_block_idx[:, seq_idx, m_local, :n_blocks_k] = n_blocks_global
+        full_block_cnt[seq_idx, :, m_local] = n_blocks_k
+        full_block_idx[seq_idx, :, m_local, :n_blocks_k] = n_blocks_global
 
 
 def _compute_generic_varlen_blocks(
@@ -336,13 +332,13 @@ def _compute_generic_varlen_blocks(
                     partial_blocks.append(n_block_global)
             
             if full_blocks:
-                full_block_cnt[h_q, seq_idx, m_local] = len(full_blocks)
-                full_block_idx[h_q, seq_idx, m_local, :len(full_blocks)] = torch.tensor(
+                full_block_cnt[seq_idx, h_q, m_local] = len(full_blocks)
+                full_block_idx[seq_idx, h_q, m_local, :len(full_blocks)] = torch.tensor(
                     full_blocks, device=device, dtype=torch.int32
                 )
             
             if partial_blocks:
-                mask_block_cnt[h_q, seq_idx, m_local] = len(partial_blocks)
-                mask_block_idx[h_q, seq_idx, m_local, :len(partial_blocks)] = torch.tensor(
+                mask_block_cnt[seq_idx, h_q, m_local] = len(partial_blocks)
+                mask_block_idx[seq_idx, h_q, m_local, :len(partial_blocks)] = torch.tensor(
                     partial_blocks, device=device, dtype=torch.int32
                 )

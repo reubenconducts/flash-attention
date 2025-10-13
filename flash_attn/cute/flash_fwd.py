@@ -1584,20 +1584,20 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 # block sparsity for flex attention
                 if const_expr(mask_block_cnt is not None and full_block_cnt is not None):
                     # load partially-masked blocks before fully-computed ones
-                    curr_mask_block_cnt = mask_block_cnt[head_idx, batch_idx, m_block]
+                    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
                     if curr_mask_block_cnt > 0:
                         for i in cutlass.range(curr_mask_block_cnt):
                             n_block_mask = mask_block_idx[
-                                head_idx, batch_idx, m_block, curr_mask_block_cnt - 1 - i
+                                batch_idx, head_idx, m_block, curr_mask_block_cnt - 1 - i
                             ]
                             load_K(n_block_mask, producer_state=kv_producer_state)
                             load_V(n_block_mask, producer_state=kv_producer_state)
                             kv_producer_state.advance()
-                    curr_full_block_cnt = full_block_cnt[head_idx, batch_idx, m_block]
+                    curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block]
                     if curr_full_block_cnt > 0:
                         for j in cutlass.range(curr_full_block_cnt):
                             n_block_full = full_block_idx[
-                                head_idx, batch_idx, m_block, curr_full_block_cnt - 1 - j
+                                batch_idx, head_idx, m_block, curr_full_block_cnt - 1 - j
                             ]
                             load_K(n_block_full, producer_state=kv_producer_state)
                             load_V(n_block_full, producer_state=kv_producer_state)
@@ -1695,7 +1695,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tiled_mma_qk=tiled_mma_qk, tiled_mma_pv=tiled_mma_pv, tiled_mma_pv_rs=tiled_mma_pv_rs,
             pipeline_k=pipeline_k, pipeline_v=pipeline_v,
             mma_params=mma_params, smem_copy_params=smem_copy_params,
-            thr_mma_qk=thr_mma_qk,
+            # thr_mma_qk=thr_mma_qk,
             check_inf=True,
         )
 
@@ -1713,11 +1713,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             softmax = Softmax(softmax_scale_log2, num_rows=acc_O.shape[0][0] * acc_O.shape[1], softmax_scale=softmax_scale)
             m_block, head_idx, batch_idx = work_tile.tile_idx
             score_mod = self.score_mod
-            mma_one_n_block = partial(
-                mma_one_n_block_all, softmax=softmax, score_mod=score_mod,
-                batch_idx=batch_idx, head_idx=head_idx, m_block=m_block, buffers=buffers,
-                fastdiv_mods=fastdiv_mods
-            )
             seqlen = SeqlenInfoCls(batch_idx)
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
             mask_fn = partial(
@@ -1729,6 +1724,21 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
                 buffers=buffers,
+            )
+            score_mod_fn = partial(
+                self.apply_score_mod,
+                thr_mma_qk=thr_mma_qk,
+                batch_idx=batch_idx,
+                head_idx=head_idx,
+                m_block=m_block,
+                softmax=softmax,
+                buffers=buffers,
+                fastdiv_mods=fastdiv_mods,
+            ) if const_expr(score_mod is not None) else None
+            mma_one_n_block = partial(
+                mma_one_n_block_all,
+                softmax=softmax,
+                score_mod_fn=score_mod_fn,
             )
             softmax.reset()
             # Load Q if not TMA_Q
@@ -1769,41 +1779,29 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 # ==========================================
                 # Flex Attention blocksparse mask processing
                 # ==========================================
-                curr_mask_block_cnt = mask_block_cnt[head_idx, batch_idx, m_block]
-                curr_full_block_cnt = full_block_cnt[head_idx, batch_idx, m_block]
+                curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
+                curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block]
                 if curr_mask_block_cnt > 0:
-                    curr_mask_block_idx = mask_block_idx[head_idx, batch_idx, m_block, None]
+                    curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block, None]
                     
                     if const_expr(self.intra_wg_overlap):
-                        # TODO
-                        # acc_S = cute.make_fragment(
-                        #     tiled_mma_qk.partition_shape_C((self.m_block_size, self.n_block_size)),
-                        #     Float32,
-                        # )
                         mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
                         
                         kv_consumer_state = self.first_half_block_overlap(
                             acc_S,
-                            m_block,
                             mask_n_block,
                             tiled_mma_qk,
                             tSrQ,
                             tSrK,
                             kv_consumer_state,
                             pipeline_k,
-                            tidx,
                             partial(mask_fn, mask_mod=self.mask_mod),
+                            score_mod_fn=score_mod_fn,
                             is_first_block=True,
                             mask_seqlen=True,
                             mma_params=mma_params,
                             smem_copy_params=smem_copy_params,
                             softmax=softmax,
-                            score_mod=score_mod,
-                            batch_idx=batch_idx,
-                            head_idx=head_idx,
-                            thr_mma_qk=thr_mma_qk,
-                            buffers=buffers,
-                            fastdiv_mods=fastdiv_mods,
                         )
                         O_should_accumulate = True
                         
@@ -1855,7 +1853,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 # Blocksparse Full Block processing
                 # ==========================================
                 if curr_full_block_cnt > 0:
-                    curr_full_block_idx = full_block_idx[head_idx, batch_idx, m_block, None]
+                    curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block, None]
                     if const_expr(self.intra_wg_overlap):
                         # Overlap mode: manually handle first block
                         start_loop_at = 0
@@ -1863,26 +1861,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             full_n_block = curr_full_block_idx[curr_full_block_cnt - 1]
                             kv_consumer_state = self.first_half_block_overlap(
                                 acc_S,
-                                m_block,
                                 full_n_block,
                                 tiled_mma_qk,
                                 tSrQ,
                                 tSrK,
                                 kv_consumer_state,
                                 pipeline_k,
-                                tidx,
                                 partial(mask_fn, mask_mod=None),
+                                score_mod_fn=score_mod_fn,
                                 is_first_block=True,
                                 mask_seqlen=True,
                                 mma_params=mma_params,
                                 smem_copy_params=smem_copy_params,
                                 softmax=softmax,
-                                score_mod=score_mod,
-                                batch_idx=batch_idx,
-                                head_idx=head_idx,
-                                thr_mma_qk=thr_mma_qk,
-                                buffers=buffers,
-                                fastdiv_mods=fastdiv_mods,
                             )
                             start_loop_at = 1
                         else:
@@ -1947,26 +1938,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if const_expr(self.intra_wg_overlap):
                     kv_consumer_state = self.first_half_block_overlap(
                         acc_S,
-                        m_block,
                         n_block_max-1,
                         tiled_mma_qk,
                         tSrQ,
                         tSrK,
                         kv_consumer_state,
                         pipeline_k,
-                        tidx,
                         partial(mask_fn, mask_mod=None),
+                        score_mod_fn=score_mod_fn,
                         is_first_block=True,
                         mask_seqlen=True,
                         mma_params=mma_params,
                         smem_copy_params=smem_copy_params,
                         softmax=softmax,
-                        score_mod=score_mod,
-                        batch_idx=batch_idx,
-                        head_idx=head_idx,
-                        thr_mma_qk=thr_mma_qk,
-                        buffers=buffers,
-                        fastdiv_mods=fastdiv_mods,
                     )
                     
                 else:
@@ -2008,7 +1992,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
                         n_block = n_block_max - 1 - n_tile
                         kv_consumer_state = mma_one_n_block(
-                            tidx,
                             n_block, kv_consumer_state,
                             check_inf=True, mask_fn=partial(mask_fn, mask_seqlen=False),
                             O_should_accumulate=O_should_accumulate
@@ -2060,26 +2043,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     def first_half_block_overlap(
         self,
         acc_S: cute.Tensor,
-        m_block: Int32,
         n_block: Int32,
         tiled_mma_qk: cute.TiledMma,
         tSrQ: cute.Tensor,
         tSrK: cute.Tensor,
         kv_consumer_state,
         pipeline_k,
-        tidx: Int32,
         mask_fn: Callable,
+        score_mod_fn: Callable,
         is_first_block: bool,
         mask_seqlen: bool,
         mma_params,
         smem_copy_params,
         softmax,
-        score_mod: Callable,
-        batch_idx: cutlass.Int32,
-        head_idx: cutlass.Int32,
-        thr_mma_qk: cute.TiledMma,
-        buffers=None,
-        fastdiv_mods=None,
     ):
         """Processes the first half block (QK GEMM thru softmax) when using intra-warpgroup-overlap"""
         pipeline_k.consumer_wait(kv_consumer_state)
@@ -2094,18 +2070,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
 
         pipeline_k.consumer_release(kv_consumer_state)
-        if cutlass.const_expr(score_mod is not None):
-            self.apply_score_mod(
-                acc_S,
-                thr_mma_qk,
-                batch_idx,
-                head_idx,
-                m_block,
-                n_block,
-                softmax=softmax,
-                buffers=buffers,
-                fastdiv_mods=fastdiv_mods,
-            )
+        
+        # score mod and mask mod application
+        if cutlass.const_expr(score_mod_fn is not None):
+            score_mod_fn(acc_S, n_block=n_block)
         mask_fn(acc_S, n_block=n_block, mask_seqlen=mask_seqlen)
         
         softmax.online_softmax(acc_S, is_first=is_first_block)
@@ -2166,14 +2134,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mma_params: SimpleNamespace,
         smem_copy_params: SimpleNamespace,
         softmax: Softmax,
-        score_mod: Callable,
-        batch_idx: cutlass.Int32,
-        head_idx: cutlass.Int32,
-        m_block: cutlass.Int32,
-        thr_mma_qk: cute.TiledMma,
-        buffers=None,
-        fastdiv_mods=None,
         mask_fn: Optional[Callable] = None,
+        score_mod_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
         O_should_accumulate: cutlass.Boolean = True,
@@ -2190,20 +2152,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.warp_scheduler_barrier_arrive()
         warpgroup.wait_group(0)
         pipeline_k.consumer_release(smem_pipe_read)
-        if cutlass.const_expr(score_mod is not None):
-            self.apply_score_mod(
-                acc_S,
-                thr_mma_qk,
-                batch_idx,
-                head_idx,
-                m_block,
-                n_block,
-                softmax=softmax,
-                buffers=buffers,
-                fastdiv_mods=fastdiv_mods,
-            )
+        
+        # score mod and mask mod application
+        if cutlass.const_expr(score_mod_fn is not None):
+            score_mod_fn(acc_S, n_block=n_block)
         if const_expr(mask_fn is not None):
             mask_fn(acc_S, n_block=n_block)
+            
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
         # if cute.arch.thread_idx()[0] == 0: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
         tOrP_acc = cute.make_tensor(acc_S.iterator, utils.convert_layout_acc_frgA(acc_S.layout))
@@ -2242,14 +2197,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mma_params: SimpleNamespace,
         smem_copy_params: SimpleNamespace,
         softmax: Softmax,
-        score_mod: Callable,
-        batch_idx: cutlass.Int32,
-        head_idx: cutlass.Int32,
-        m_block: cutlass.Int32,
-        thr_mma_qk: cute.TiledMma,
-        buffers=None,
-        fastdiv_mods=None,
         mask_fn: Optional[Callable] = None,
+        score_mod_fn: Optional[Callable] = None,
         check_inf: cutlass.Constexpr = True,
         O_should_accumulate: cutlass.Boolean = True,
     ):
@@ -2274,22 +2223,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.warp_scheduler_barrier_arrive()
         warpgroup.wait_group(1)
         pipeline_k.consumer_release(smem_pipe_read)
-        if cutlass.const_expr(score_mod is not None):
-            self.apply_score_mod(
-                acc_S,
-                thr_mma_qk,
-                batch_idx,
-                head_idx,
-                m_block,
-                n_block,
-                softmax=softmax,
-                buffers=buffers,
-                fastdiv_mods=fastdiv_mods,
-            )
-        # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
+        
+        # score mod and mask mod application
+        if cutlass.const_expr(score_mod_fn is not None):
+            score_mod_fn(acc_S, n_block=n_block)
         if const_expr(mask_fn is not None):
             mask_fn(acc_S, n_block=n_block)
-        # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
+
         row_scale = softmax.online_softmax(acc_S, check_inf=check_inf)
         warpgroup.wait_group(0)
         pipeline_v.consumer_release(smem_pipe_read_v)
