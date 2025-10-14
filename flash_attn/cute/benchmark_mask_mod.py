@@ -52,8 +52,8 @@ class BenchmarkConfig:
     softcap: Optional[float] = None
 
     # Kernel configuration
-    m_block_size: int = 128
-    n_block_size: int = 128
+    tile_m: int = 128
+    tile_n: int = 128
     num_stages: int = 2
     num_threads: int = 384
     intra_wg_overlap: bool = True
@@ -219,12 +219,12 @@ class FlashAttentionBenchmark:
                                        tensors["cu_seqlens_q"][i]).item()
                             seq_len_k = (tensors["cu_seqlens_k"][i+1] - 
                                        tensors["cu_seqlens_k"][i]).item()
-                            n_blocks_q = (seq_len_q + config.m_block_size - 1) // config.m_block_size
-                            n_blocks_k = (seq_len_k + config.n_block_size - 1) // config.n_block_size
+                            n_blocks_q = (seq_len_q + config.tile_m - 1) // config.tile_m
+                            n_blocks_k = (seq_len_k + config.tile_n - 1) // config.tile_n
                             max_blocks += n_blocks_q * n_blocks_k * config.nheads
                     else:
-                        n_blocks_k = (config.seqlen_k + config.n_block_size - 1) // config.n_block_size
-                        n_blocks_q = (config.seqlen_q + config.m_block_size - 1) // config.m_block_size
+                        n_blocks_k = (config.seqlen_k + config.tile_n - 1) // config.tile_n
+                        n_blocks_q = (config.seqlen_q + config.tile_m - 1) // config.tile_m
                         max_blocks = n_blocks_k * n_blocks_q * config.nheads * config.batch_size
                     
                     skipped = max_blocks - total_full - total_partial
@@ -254,8 +254,8 @@ class FlashAttentionBenchmark:
             is_causal=config.causal,
             is_local=False,
             pack_gqa=False,
-            m_block_size=config.m_block_size,
-            n_block_size=config.n_block_size,
+            tile_m=config.tile_m,
+            tile_n=config.tile_n,
             num_stages=config.num_stages,
             num_threads=config.num_threads,
             intra_wg_overlap=config.intra_wg_overlap,
@@ -330,7 +330,6 @@ class FlashAttentionBenchmark:
             None,  # seqused_q
             None,  # seqused_k
             None,  # page_table
-            None,  # softcap
             None,  # window_size_left
             None,  # window_size_right
             None,  # learnable_sink
@@ -344,7 +343,7 @@ class FlashAttentionBenchmark:
             q_cute, k_cute, v_cute, out_cute, lse_cute,
             softmax_scale, current_stream,
             cu_seqlens_q_cute, cu_seqlens_k_cute,
-            None, None, None, None, None, None, None,
+            None, None, None, None, None, None,
             full_block_cnt_cute, full_block_idx_cute,
             mask_block_cnt_cute, mask_block_idx_cute,
             buffers_cute
@@ -518,8 +517,8 @@ if __name__ == "__main__":
         max_seqlen_q=4096,
         min_seqlen_k=2048,
         max_seqlen_k=4096,
-        use_mask_mod=False,
-        mask_mod_name="document",
+        use_mask_mod=True,
+        mask_mod_name="causal",
         causal=False,
         verbose=True,
     )

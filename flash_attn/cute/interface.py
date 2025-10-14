@@ -76,7 +76,7 @@ def _flash_attn_fwd(
     num_threads: int = 384,
     pack_gqa: Optional[bool] = None,
     _compute_capability: Optional[int] = None,
-    score_mod: Callable | None = None,
+    score_mod: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
     full_block_cnt: Optional[torch.Tensor] = None,
     full_block_idx: Optional[torch.Tensor] = None,
@@ -232,7 +232,10 @@ def _flash_attn_fwd(
         # TODO: fix the varlen case
         if pack_gqa and (128 % qhead_per_kvhead != 0) or (cu_seqlens_q is not None or seqused_q is not None):
             pack_gqa = False
+            
+    score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else None
     mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else None
+    
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
         score_mod = utils.create_softcap_scoremod(softcap)
@@ -249,7 +252,8 @@ def _flash_attn_fwd(
         cute_buffers = [from_dlpack(buf) for buf in buffers]
 
     compile_key = (
-        dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, utils.hash_callable(score_mod) if score_mod is not None else None,
+        dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, 
+        score_mod_hash, mask_mod_hash,
         buffers is not None,
         lse is None, cu_seqlens_q is None, cu_seqlens_k is None, seqused_q is None, seqused_k is None,
         page_table is not None,
@@ -277,7 +281,7 @@ def _flash_attn_fwd(
                 num_stages=2,
                 num_threads=num_threads,
                 Q_in_regs=False,
-                intra_wg_overlap=False,
+                intra_wg_overlap=True,
                 mma_pv_is_rs=True,
                 mask_mod=mask_mod,
                 score_mod=score_mod,
@@ -307,15 +311,14 @@ def _flash_attn_fwd(
             full_block_cnt_tensor, full_block_idx_tensor, mask_block_cnt_tensor, mask_block_idx_tensor,
             cute_buffers,
         )
-    else:
-        _flash_attn_fwd.compile_cache[compile_key](
-            q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
-            cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
-            page_table_tensor,
-            window_size_left, window_size_right, learnable_sink_tensor,
-            full_block_cnt_tensor, full_block_idx_tensor, mask_block_cnt_tensor, mask_block_idx_tensor,
-            cute_buffers,
-        )
+    _flash_attn_fwd.compile_cache[compile_key](
+        q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
+        cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
+        page_table_tensor,
+        window_size_left, window_size_right, learnable_sink_tensor,
+        full_block_cnt_tensor, full_block_idx_tensor, mask_block_cnt_tensor, mask_block_idx_tensor,
+        cute_buffers,
+    )
     return out, lse
 
 

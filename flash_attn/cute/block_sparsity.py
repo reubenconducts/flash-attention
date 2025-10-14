@@ -43,12 +43,12 @@ def compute_block_sparsity(
         max_m_blocks = 0
         for seq_idx in range(config.batch_size):
             seq_len_q = (cu_seqlens_q[seq_idx + 1] - cu_seqlens_q[seq_idx]).item()
-            n_blocks_q = (seq_len_q + config.m_block_size - 1) // config.m_block_size
+            n_blocks_q = (seq_len_q + config.tile_m - 1) // config.tile_m
             max_m_blocks = max(max_m_blocks, n_blocks_q)
         
         # Allocate padded tensors with (batch, head, ...) ordering
         total_k = cu_seqlens_k[-1].item()
-        max_n_blocks = (total_k + config.n_block_size - 1) // config.n_block_size
+        max_n_blocks = (total_k + config.tile_n - 1) // config.tile_n
         
         full_block_cnt = torch.zeros(
             (config.batch_size, num_heads, max_m_blocks), device=device, dtype=torch.int32
@@ -73,12 +73,12 @@ def compute_block_sparsity(
             seq_end_k = cu_seqlens_k[seq_idx + 1].item()
             seq_len_k = seq_end_k - seq_start_k
             
-            n_blocks_q = (seq_len_q + config.m_block_size - 1) // config.m_block_size
-            n_blocks_k = (seq_len_k + config.n_block_size - 1) // config.n_block_size
+            n_blocks_q = (seq_len_q + config.tile_m - 1) // config.tile_m
+            n_blocks_k = (seq_len_k + config.tile_n - 1) // config.tile_n
             
             # Global block indices for this sequence
-            first_m_block_global = seq_start_q // config.m_block_size
-            first_n_block_global = seq_start_k // config.n_block_size
+            first_m_block_global = seq_start_q // config.tile_m
+            first_n_block_global = seq_start_k // config.tile_n
             
             # Apply mask pattern (treating indices as sequence-local)
             if config.mask_mod_name == "causal":
@@ -86,7 +86,7 @@ def compute_block_sparsity(
                     full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx,
                     seq_idx, num_heads, n_blocks_q, n_blocks_k,
                     seq_start_q, seq_end_q, seq_start_k, seq_end_k,
-                    first_n_block_global, config.m_block_size, config.n_block_size,
+                    first_n_block_global, config.tile_m, config.tile_n,
                     device
                 )
             elif config.mask_mod_name == "identity":
@@ -102,7 +102,7 @@ def compute_block_sparsity(
                     mask_mod_flex, seq_idx, num_heads, n_blocks_q, n_blocks_k,
                     seq_start_q, seq_end_q, seq_start_k, seq_end_k,
                     seq_len_q, seq_len_k, first_n_block_global,
-                    config.m_block_size, config.n_block_size, config.nheads_kv,
+                    config.tile_m, config.tile_n, config.nheads_kv,
                     device
                 )
         
@@ -110,8 +110,8 @@ def compute_block_sparsity(
     
     else:
         # Non-varlen: use (batch, head, ...) ordering
-        n_blocks_k = (config.seqlen_k + config.n_block_size - 1) // config.n_block_size
-        n_blocks_q = (config.seqlen_q + config.m_block_size - 1) // config.m_block_size
+        n_blocks_k = (config.seqlen_k + config.tile_n - 1) // config.tile_n
+        n_blocks_q = (config.seqlen_q + config.tile_m - 1) // config.tile_m
 
         full_block_cnt = torch.zeros(
             (config.batch_size, num_heads, n_blocks_q), device=device, dtype=torch.int32
@@ -150,13 +150,13 @@ def compute_block_sparsity(
             q_blocks = torch.arange(n_blocks_q, device=device)
             k_blocks = torch.arange(n_blocks_k, device=device)
 
-            q_starts = q_blocks * config.m_block_size
+            q_starts = q_blocks * config.tile_m
             q_ends = torch.minimum(
-                (q_blocks + 1) * config.m_block_size, torch.tensor(config.seqlen_q, device=device)
+                (q_blocks + 1) * config.tile_m, torch.tensor(config.seqlen_q, device=device)
             )
-            k_starts = k_blocks * config.n_block_size
+            k_starts = k_blocks * config.tile_n
             k_ends = torch.minimum(
-                (k_blocks + 1) * config.n_block_size, torch.tensor(config.seqlen_k, device=device)
+                (k_blocks + 1) * config.tile_n, torch.tensor(config.seqlen_k, device=device)
             )
 
             q_starts = q_starts.unsqueeze(1)
@@ -186,16 +186,16 @@ def compute_block_sparsity(
             for b in range(config.batch_size):
                 for h in range(num_heads):
                     for q_block in range(n_blocks_q):
-                        q_start = q_block * config.m_block_size
-                        q_end = min((q_block + 1) * config.m_block_size, config.seqlen_q) - 1
+                        q_start = q_block * config.tile_m
+                        q_end = min((q_block + 1) * config.tile_m, config.seqlen_q) - 1
                         
                         # Since monotone non-decreasing, just check corners
                         doc_q_start = doc_ids[b, h, q_start]
                         doc_q_end = doc_ids[b, h, q_end]
                         
                         for k_block in range(n_blocks_k):
-                            k_start = k_block * config.n_block_size
-                            k_end = min((k_block + 1) * config.n_block_size, config.seqlen_k) - 1
+                            k_start = k_block * config.tile_n
+                            k_end = min((k_block + 1) * config.tile_n, config.seqlen_k) - 1
                             
                             doc_k_start = doc_ids[b, h, k_start]
                             doc_k_end = doc_ids[b, h, k_end]
@@ -220,20 +220,20 @@ def _compute_causal_varlen_blocks(
     full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx,
     seq_idx, num_heads, n_blocks_q, n_blocks_k,
     seq_start_q, seq_end_q, seq_start_k, seq_end_k,
-    first_n_block_global, m_block_size, n_block_size, device
+    first_n_block_global, tile_m, tile_n, device
 ):
     """Compute causal block sparsity for one varlen sequence"""
     for m_local in range(n_blocks_q):
-        m_start_global = seq_start_q + m_local * m_block_size
-        m_end_global = min(seq_start_q + (m_local + 1) * m_block_size, seq_end_q)
+        m_start_global = seq_start_q + m_local * tile_m
+        m_end_global = min(seq_start_q + (m_local + 1) * tile_m, seq_end_q)
         
         full_blocks = []
         partial_blocks = []
         
         for n_local in range(n_blocks_k):
             n_block_global = first_n_block_global + n_local
-            n_start_global = seq_start_k + n_local * n_block_size
-            n_end_global = min(seq_start_k + (n_local + 1) * n_block_size, seq_end_k)
+            n_start_global = seq_start_k + n_local * tile_n
+            n_end_global = min(seq_start_k + (n_local + 1) * tile_n, seq_end_k)
             
             # Convert to sequence-local coordinates for causal check
             m_start_local = m_start_global - seq_start_q
@@ -292,7 +292,7 @@ def _compute_generic_varlen_blocks(
     mask_mod_flex, seq_idx, num_heads, n_blocks_q, n_blocks_k,
     seq_start_q, seq_end_q, seq_start_k, seq_end_k,
     seq_len_q, seq_len_k, first_n_block_global,
-    m_block_size, n_block_size, nheads_kv, device
+    tile_m, tile_n, nheads_kv, device
 ):
     """Generic sampling-based block classification for varlen sequences"""
     qhead_per_kvhead = num_heads // nheads_kv
@@ -301,16 +301,16 @@ def _compute_generic_varlen_blocks(
         h_kv = h_q // qhead_per_kvhead
         
         for m_local in range(n_blocks_q):
-            m_start_local = m_local * m_block_size
-            m_end_local = min((m_local + 1) * m_block_size, seq_len_q)
+            m_start_local = m_local * tile_m
+            m_end_local = min((m_local + 1) * tile_m, seq_len_q)
             
             full_blocks = []
             partial_blocks = []
             
             for n_local in range(n_blocks_k):
                 n_block_global = first_n_block_global + n_local
-                n_start_local = n_local * n_block_size
-                n_end_local = min((n_local + 1) * n_block_size, seq_len_k)
+                n_start_local = n_local * tile_n
+                n_end_local = min((n_local + 1) * tile_n, seq_len_k)
                 
                 # Sample positions (using sequence-local coordinates for mask_mod)
                 sample_positions = [

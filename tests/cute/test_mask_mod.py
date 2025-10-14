@@ -47,8 +47,8 @@ def compile_and_run_kernel(
     tensors,
     mask_mod_cute,
     causal,
-    m_block_size,
-    n_block_size,
+    tile_m,
+    tile_n,
     full_block_cnt=None,
     full_block_idx=None,
     mask_block_cnt=None,
@@ -82,8 +82,8 @@ def compile_and_run_kernel(
         is_causal=causal,
         is_local=False,
         pack_gqa=False,
-        m_block_size=m_block_size,
-        n_block_size=n_block_size,
+        tile_m=tile_m,
+        tile_n=tile_n,
         num_stages=2,
         num_threads=384,
         intra_wg_overlap=True,
@@ -167,7 +167,7 @@ def compile_and_run_kernel(
 
 
 def compute_reference(
-    tensors, mask_mod_flex, mask_mod_name, causal, m_block_size, n_block_size
+    tensors, mask_mod_flex, mask_mod_name, causal, tile_m, tile_n
 ):
     batch_size, seqlen_q, nheads, headdim = tensors["q"].shape
     _, seqlen_k, nheads_kv, _ = tensors["k"].shape
@@ -196,18 +196,18 @@ def compute_reference(
 
     if mask_fn is not None:
         if mask_mod_name == "block_causal":
-            n_blocks_q = (seqlen_q + m_block_size - 1) // m_block_size
-            n_blocks_k = (seqlen_k + n_block_size - 1) // n_block_size
+            n_blocks_q = (seqlen_q + tile_m - 1) // tile_m
+            n_blocks_k = (seqlen_k + tile_n - 1) // tile_n
 
             mask = torch.zeros(seqlen_q, seqlen_k, dtype=torch.bool, device=q.device)
 
             for q_block in range(n_blocks_q):
-                q_start = q_block * m_block_size
-                q_end = min((q_block + 1) * m_block_size, seqlen_q)
+                q_start = q_block * tile_m
+                q_end = min((q_block + 1) * tile_m, seqlen_q)
                 for k_block in range(n_blocks_k):
                     if k_block <= q_block:
-                        k_start = k_block * n_block_size
-                        k_end = min((k_block + 1) * n_block_size, seqlen_k)
+                        k_start = k_block * tile_n
+                        k_end = min((k_block + 1) * tile_n, seqlen_k)
                         mask[q_start:q_end, k_start:k_end] = True
 
             attn_mask = (
@@ -235,50 +235,48 @@ def compute_reference(
     "seqlen_q,seqlen_k",
     [
         (1, 1),
-        # (64, 128),
+        (64, 128),
         (128, 192),
         (256, 256),
-        # (239, 1),
-        # (799, 3),
-        # (113, 203),
-        # (113, 128),
+        (239, 1),
+        (799, 3),
+        (113, 203),
+        (113, 128),
         (128, 217),
-        # (113, 211),
-        # (108, 256),
+        (113, 211),
+        (108, 256),
         (256, 512),
         (384, 256),
-        # (640, 128),
+        (640, 128),
         (512, 256),
         (1024, 1024),
-        # (1023, 1024),
+        (1023, 1024),
         (1024, 1023),
         (4096, 4096),
-        # (4224, 4224),
+        (4224, 4224),
     ],
 )
 # @pytest.mark.parametrize("nheads", [4, 16, 32, 64])
-@pytest.mark.parametrize("nheads", [16])
-# @pytest.mark.parametrize("nheads", [4, 16, 32])
+@pytest.mark.parametrize("nheads", [4, 16])
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa", "mqa"])
-# @pytest.mark.parametrize("kv_mode", ["mha"])
-# @pytest.mark.parametrize("headdim", [64, 128])
-@pytest.mark.parametrize("headdim", [128])
+@pytest.mark.parametrize("headdim", [64, 128])
+# @pytest.mark.parametrize("headdim", [128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
     "use_mask_mod,mask_name",
     [
-        (False, "identity"),
-        (False, "causal"),
-        # (True, "identity"),
+        # (False, "identity"),
+        # (False, "causal"),
+        # # (True, "identity"),
         (True, "causal"),
         (True, "block_causal"),
         # (True, "sliding_window"),
     ],
 )
-# @pytest.mark.parametrize("m_block_size,n_block_size", [(64, 64), (128, 128), (128, 64)])
-@pytest.mark.parametrize("m_block_size,n_block_size", [(128, 128),])
+# @pytest.mark.parametrize("tile_m,tile_n", [(64, 64), (128, 128), (128, 64)])
+@pytest.mark.parametrize("tile_m,tile_n", [(128, 128),])
 def test_mask_mod_output(
-    seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use_mask_mod, mask_name, m_block_size, n_block_size
+    seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use_mask_mod, mask_name, tile_m, tile_n
 ):
     torch.manual_seed(42)
 
@@ -298,7 +296,7 @@ def test_mask_mod_output(
     # Determine mask_mod functions and causal flag
     if use_mask_mod:
         mask_mod_cute, mask_mod_flex = MASK_FUNCTIONS[mask_name]
-        causal = False
+        causal = (mask_name == "causal")
     else:
         mask_mod_cute = None
         mask_mod_flex = None
@@ -323,8 +321,8 @@ def test_mask_mod_output(
             nheads: int
             nheads_kv: int
             batch_size: int
-            m_block_size: int
-            n_block_size: int
+            tile_m: int
+            tile_n: int
             use_mask_mod: bool
             mask_mod_name: str
             verbose: bool = False
@@ -335,8 +333,8 @@ def test_mask_mod_output(
             nheads=nheads,
             nheads_kv=nheads_kv,
             batch_size=batch_size,
-            m_block_size=m_block_size,
-            n_block_size=n_block_size,
+            tile_m=tile_m,
+            tile_n=tile_n,
             use_mask_mod=True,
             mask_mod_name=mask_name,
         )
@@ -350,8 +348,8 @@ def test_mask_mod_output(
         tensors,
         mask_mod_cute,
         causal=causal,
-        m_block_size=m_block_size,
-        n_block_size=n_block_size,
+        tile_m=tile_m,
+        tile_n=tile_n,
         full_block_cnt=full_cnt,
         full_block_idx=full_idx,
         mask_block_cnt=mask_cnt,
@@ -368,8 +366,8 @@ def test_mask_mod_output(
         mask_mod_flex if use_mask_mod else None,
         mask_name,
         causal=causal,
-        m_block_size=m_block_size,
-        n_block_size=n_block_size,
+        tile_m=tile_m,
+        tile_n=tile_n,
     )
 
     # Compute reference at original dtype
@@ -378,8 +376,8 @@ def test_mask_mod_output(
         mask_mod_flex if use_mask_mod else None,
         mask_name,
         causal=causal,
-        m_block_size=m_block_size,
-        n_block_size=n_block_size,
+        tile_m=tile_m,
+        tile_n=tile_n,
     )
 
     # If using mask_mod causal, also verify against built-in causal
@@ -389,8 +387,8 @@ def test_mask_mod_output(
             mask_mod_flex=None,
             mask_mod_name="causal",
             causal=True,  # Use built-in causal
-            m_block_size=m_block_size,
-            n_block_size=n_block_size,
+            tile_m=tile_m,
+            tile_n=tile_n,
         )
 
         builtin_causal_error = (out_ref_fp32 - out_builtin_causal).abs().max().item()
@@ -417,7 +415,7 @@ def test_mask_mod_output(
     mask_desc = f"mask_mod={mask_name}" if use_mask_mod else mask_name
     print(
         f"\n{mask_desc} @ Q={seqlen_q}, K={seqlen_k}, H={nheads}/{nheads_kv} ({kv_mode}), "
-        f"D={headdim}, M={m_block_size}, N={n_block_size}"
+        f"D={headdim}, M={tile_m}, N={tile_n}"
     )
     print(f"  Reference vs FP32: {ref_error:.2e}")
     print(f"  Kernel vs FP32: {cute_error:.2e}")

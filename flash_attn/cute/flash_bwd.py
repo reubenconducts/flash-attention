@@ -11,7 +11,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
-import cutlass.utils as utils_basic
+import cutlass.utils.ampere_helpers as sm80_utils_basic
 
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute import utils
@@ -125,7 +125,7 @@ class FlashAttentionBackwardSm80:
         smem_usage_V = n_block_size * head_dim_v * 2
         smem_usage_QV = (smem_usage_Q + smem_usage_V) if not V_in_regs else max(smem_usage_Q, smem_usage_V)
         smem_usage = smem_usage_QV + smem_usage_dO + smem_usage_K
-        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_80")
+        smem_capacity = sm80_utils_basic.SMEM_CAPACITY["sm80"]
         if smem_usage > smem_capacity:
             return False
         return True
@@ -347,9 +347,6 @@ class FlashAttentionBackwardSm80:
         # Get the data type and check if it is fp16 or bf16
         self._check_type(*(t.element_type if t is not None else None
                            for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV)))
-        # Assume all strides are divisible by 128 bits except the last stride
-        new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
-        mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) if t is not None else None for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV)]
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         tiled_mma_sdp, tiled_mma_dkv, tiled_mma_dq = self._get_tiled_mma()
@@ -405,7 +402,7 @@ class FlashAttentionBackwardSm80:
         mdO: cute.Tensor,
         mLSE: cute.Tensor,
         mdPsum: cute.Tensor,
-        mdQaccum: cute.Tensor,
+        mdQaccu: cute.Tensor,
         mdK: cute.Tensor,
         mdV: cute.Tensor,
         softmax_scale: cutlass.Float32,
@@ -459,7 +456,7 @@ class FlashAttentionBackwardSm80:
         gdO = cute.local_tile(mdO[batch_idx, None, head_idx, None], blkdO_shape, (None, 0))
         gLSE = cute.local_tile(mLSE[batch_idx, head_idx, None], (self.m_block_size,), (None,))
         gdPsum = cute.local_tile(mdPsum[batch_idx, head_idx, None], (self.m_block_size,), (None,))
-        gdQaccum = cute.local_tile(mdQaccum[batch_idx, head_idx, None], (self.m_block_size * self.head_dim_padded,), (None,))
+        gdQaccum = cute.local_tile(mdQaccu[batch_idx, head_idx, None], (self.m_block_size * self.head_dim_padded,), (None,))
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer

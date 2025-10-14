@@ -119,7 +119,7 @@ def cute_sliding_window_mask(
 
 @cute.jit
 def cute_document_mask(
-    batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32, seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers: list[cute.Tensor],
+    batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32, seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers: list,
 ):
     doc_id = buffers[0]
     return cutlass.Boolean(doc_id[batch, head, m_idx] == doc_id[batch, head, n_idx])

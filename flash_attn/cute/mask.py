@@ -74,19 +74,19 @@ class AttentionMask:
             
             # Use range_constexpr for guaranteed complete unrolling (zero loop overhead)
             for r in cutlass.range_constexpr(nrow):
-                global_row_idx = tScS_mn[r, 0][0] + m_block * self.m_block_size
+                global_row_idx = tScS_mn[r, 0][0] + m_block * self.tile_m
                 
                 for col in cutlass.range_constexpr(ncol):
                     col_idx_local = t0ScS_mn[0, col][1]
                     # Convert to absolute column index
-                    global_col_idx = thr_col_offset + col_idx_local + n_block * self.n_block_size
+                    global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
                     
                     cond = cutlass.Boolean(
                         mask_mod(
                             batch_idx,
                             head_idx,
-                            tScS_mn[r, 0][0] + m_block * self.m_block_size,
-                            thr_col_offset + t0ScS_mn[0, col][1] + n_block * self.n_block_size,
+                            tScS_mn[r, 0][0] + m_block * self.tile_m,
+                            thr_col_offset + t0ScS_mn[0, col][1] + n_block * self.tile_n,
                             self.seqlen_q,
                             self.seqlen_k,
                             buffers,
