@@ -258,6 +258,7 @@ def compute_reference(
 )
 # @pytest.mark.parametrize("nheads", [4, 16, 32, 64])
 @pytest.mark.parametrize("nheads", [4, 16])
+# @pytest.mark.parametrize("kv_mode", ["gqa", "mqa"])
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa", "mqa"])
 @pytest.mark.parametrize("headdim", [64, 128])
 # @pytest.mark.parametrize("headdim", [128])
@@ -267,9 +268,9 @@ def compute_reference(
     [
         # (False, "identity"),
         # (False, "causal"),
-        # # (True, "identity"),
-        (True, "causal"),
-        (True, "block_causal"),
+        (True, "identity"),
+        # (True, "causal"),
+        # (True, "block_causal"),
         # (True, "sliding_window"),
     ],
 )

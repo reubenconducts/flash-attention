@@ -22,7 +22,6 @@
 
 import math
 from typing import Optional, Tuple, Callable
-from typing import Optional, Tuple, Callable
 
 import torch
 
@@ -39,7 +38,6 @@ from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreproces
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
-from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess_sm90
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 
 
@@ -281,7 +279,7 @@ def _flash_attn_fwd(
                 num_stages=2,
                 num_threads=num_threads,
                 Q_in_regs=False,
-                intra_wg_overlap=True,
+                intra_wg_overlap=False,
                 mma_pv_is_rs=True,
                 mask_mod=mask_mod,
                 score_mod=score_mod,
