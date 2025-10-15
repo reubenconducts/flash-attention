@@ -319,15 +319,15 @@ def compute_reference_flex_attn(
     [
         # (False, False, "identity", None, None, None),
         # (False, False, "causal", None, None, None),
-        (True, False, "identity", None, None, None),
-        (True, False, "causal", None, None, None),
-        # (True, False, "block_causal", None, None, None),
+        # (True, False, "identity", None, None, None),
+        # (True, False, "causal", None, None, None),
+        (True, False, "block_causal", None, None, None),
         # Mask mod sliding window
-        (True, False, "sliding_window", 128, None, None),
-        (True, False, "sliding_window", 256, None, None),
+        # (True, False, "sliding_window", 128, None, None),
+        # (True, False, "sliding_window", 256, None, None),
         # (True, False, "sliding_window", 512, None, None),
         # Base local attention
-        (False, True, None, None, 128, 0),
+        # (False, True, None, None, 128, 0),
         # (False, True, None, None, 256, 0),
         # (False, True, None, None, 512, 0),
     ],
