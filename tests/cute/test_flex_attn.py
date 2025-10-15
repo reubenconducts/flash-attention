@@ -43,3 +43,11 @@ from test_score_mod import (
     score_mod_8,
     score_mod_9,
 )
+
+
+def main():
+    raise NotImplementedError()
+
+
+if __name__ == "__main__":
+    main()
