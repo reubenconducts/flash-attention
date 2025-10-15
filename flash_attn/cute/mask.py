@@ -67,12 +67,11 @@ class AttentionMask:
                             for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                                 acc_S_mn[r, c] = acc_S_mn[r, c] if in_bound else -cutlass.Float32.inf
                                 
-        elif cutlass.const_expr(not mask_causal and not mask_local and mask_mod is not None):
+        elif cutlass.const_expr(not mask_causal and not mask_local and mask_mod is not None): # FlexAttention mask mod
             nrow = cutlass.const_expr(cute.size(tScS_mn.shape[0]))
             ncol = cutlass.const_expr(cute.size(tScS_mn.shape[1]))
             thr_col_offset = tScS_mn[0, 0][1]
             
-            # Use range_constexpr for guaranteed complete unrolling (zero loop overhead)
             for r in cutlass.range_constexpr(nrow):
                 global_row_idx = tScS_mn[r, 0][0] + m_block * self.tile_m
                 
@@ -119,12 +118,6 @@ class AttentionMask:
             causal_row_offset = (
                 1 + self.seqlen_k - n_block * self.tile_n - self.seqlen_q - thr_col_offset
             )
-            c = 0
-            col_limit_transformed = 0
-            ncol: cute.Constexpr = 0
-            col_limit_right_s = 0
-            mask = 0
-            in_bound = False
             c = 0
             col_limit_transformed = 0
             ncol: cute.Constexpr = 0

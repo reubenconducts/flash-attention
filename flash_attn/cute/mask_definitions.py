@@ -47,10 +47,26 @@ def flex_block_causal_mask(b, h, q_idx, kv_idx, seqlen_q=None, seqlen_k=None):
     return kv_idx <= q_idx
 
 
+def create_flex_sliding_window_mask(window_size=1024):
+    """Factory function to create a sliding window mask with configurable window size"""
+    def flex_sliding_window_mask(b, h, q_idx, kv_idx, seqlen_q=None, seqlen_k=None):
+        # Sliding window: q_idx - window_size <= kv_idx <= q_idx
+        if seqlen_q is not None and seqlen_k is not None:
+            offset = seqlen_k - seqlen_q
+            return (kv_idx <= q_idx + offset) & (kv_idx >= q_idx + offset - window_size)
+        return (kv_idx <= q_idx) & (kv_idx >= q_idx - window_size)
+    return flex_sliding_window_mask
+
+
+# Default sliding window mask with window_size=1024 for backward compatibility
 def flex_sliding_window_mask(b, h, q_idx, kv_idx, seqlen_q=None, seqlen_k=None):
-    window_size = 256
-    result = abs(q_idx - kv_idx) <= window_size // 2
-    return result
+    window_size = 1024
+    if seqlen_q is not None and seqlen_k is not None:
+        offset = seqlen_k - seqlen_q
+        # Sliding window: q_pos - window_size < kv_pos <= q_pos
+        # Note: using strict inequality on the left to match typical sliding window behavior
+        return (kv_idx <= q_idx + offset) & (kv_idx > q_idx + offset - window_size)
+    return (kv_idx <= q_idx) & (kv_idx > q_idx - window_size)
 
 
 def flex_block_diagonal_mask(b, h, q_idx, kv_idx, seqlen_q=None, seqlen_k=None, block_size=64):
@@ -109,12 +125,29 @@ def cute_block_causal_mask(
     return cutlass.Boolean(n_idx <= m_idx + offset)
 
 
+def create_cute_sliding_window_mask(window_size=1024):
+    """Factory function to create a CuTe sliding window mask with configurable window size"""
+    @cute.jit
+    def cute_sliding_window_mask(
+        batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
+        seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers
+    ) -> cutlass.Boolean:
+        offset = seqlen_k - seqlen_q
+
+        return cutlass.Boolean((n_idx <= m_idx + offset) and (n_idx >= m_idx + offset - window_size))
+    return cute_sliding_window_mask
+
+
+# Default sliding window mask with window_size=1024 for backward compatibility
 @cute.jit
 def cute_sliding_window_mask(
     batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
-    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers
 ) -> cutlass.Boolean:
-    return cutlass.Boolean(m_idx - n_idx <= 128 and m_idx - n_idx >= -128)
+    window_size = 1024
+    # offset = seqlen_k - seqlen_q
+    offset = 0
+    return cutlass.Boolean((n_idx <= m_idx + offset) and (n_idx >= m_idx + offset - window_size))
 
 
 @cute.jit
@@ -128,7 +161,7 @@ def cute_document_mask(
 @cute.jit
 def cute_block_diagonal_mask(
     batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
-    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers
 ) -> cutlass.Boolean:
     return cutlass.Boolean((m_idx // 64) == (n_idx // 64))
 
@@ -136,7 +169,7 @@ def cute_block_diagonal_mask(
 @cute.jit
 def cute_mini_causal_mask(
     batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
-    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers
 ) -> cutlass.Boolean:
     """Each tile is locally causal-masked"""
     m_mod = m_idx % 128

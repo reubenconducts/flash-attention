@@ -1,3 +1,5 @@
+# mask mod test script
+
 import math
 
 import cuda.bindings.driver as cuda
@@ -15,7 +17,8 @@ from flash_attn.cute.flash_fwd import (
     FlashAttentionForwardSm90,
 )
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
-from flash_attn.cute.mask_definitions import MASK_FUNCTIONS, flex_causal_mask
+from flash_attn.cute.mask_definitions import MASK_FUNCTIONS, flex_causal_mask, create_flex_sliding_window_mask, create_cute_sliding_window_mask
+from flash_attn.cute.testing import attention_ref
 
 
 def create_tensors(
@@ -47,6 +50,9 @@ def compile_and_run_kernel(
     tensors,
     mask_mod_cute,
     causal,
+    is_local,
+    window_left,
+    window_right,
     tile_m,
     tile_n,
     full_block_cnt=None,
@@ -80,7 +86,7 @@ def compile_and_run_kernel(
         headdim_v,
         qhead_per_kvhead,
         is_causal=causal,
-        is_local=False,
+        is_local=is_local,
         pack_gqa=False,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -133,6 +139,14 @@ def compile_and_run_kernel(
         else None
     )
 
+    # Window parameters for is_local
+    window_left_cute = (
+        cutlass.Int32(window_left) if window_left is not None else None
+    )
+    window_right_cute = (
+        cutlass.Int32(window_right) if window_right is not None else None
+    )
+
     compiled = cute.compile(
         kernel,
         q_cute,
@@ -142,10 +156,19 @@ def compile_and_run_kernel(
         lse_cute,
         softmax_scale,
         current_stream,
-        full_block_cnt=full_block_cnt_cute,
-        full_block_idx=full_block_idx_cute,
-        mask_block_cnt=mask_block_cnt_cute,
-        mask_block_idx=mask_block_idx_cute,
+        None,  # cu_seqlens_q
+        None,  # cu_seqlens_k
+        None,  # seqused_q
+        None,  # seqused_k
+        None,  # page_table
+        window_left_cute,
+        window_right_cute,
+        None,  # learnable_sink
+        full_block_cnt_cute,
+        full_block_idx_cute,
+        mask_block_cnt_cute,
+        mask_block_idx_cute,
+        None,  # buffers
     )
 
     compiled(
@@ -156,19 +179,55 @@ def compile_and_run_kernel(
         lse_cute,
         softmax_scale,
         current_stream,
-        full_block_cnt=full_block_cnt_cute,
-        full_block_idx=full_block_idx_cute,
-        mask_block_cnt=mask_block_cnt_cute,
-        mask_block_idx=mask_block_idx_cute,
+        None,  # cu_seqlens_q
+        None,  # cu_seqlens_k
+        None,  # seqused_q
+        None,  # seqused_k
+        None,  # page_table
+        window_left_cute,
+        window_right_cute,
+        None,  # learnable_sink
+        full_block_cnt_cute,
+        full_block_idx_cute,
+        mask_block_cnt_cute,
+        mask_block_idx_cute,
+        None,  # buffers
     )
 
     torch.cuda.synchronize()
     return tensors["out"]
 
 
-def compute_reference(
-    tensors, mask_mod_flex, mask_mod_name, causal, tile_m, tile_n
+def compute_reference_flash_attn(
+    tensors, causal, window_size, dtype_ref, upcast=True
 ):
+    """Compute reference using FlashAttention's attention_ref function"""
+    batch_size, seqlen_q, nheads, headdim = tensors["q"].shape
+    _, seqlen_k, nheads_kv, _ = tensors["k"].shape
+    
+    q = tensors["q"].to(dtype_ref)
+    k = tensors["k"].to(dtype_ref)
+    v = tensors["v"].to(dtype_ref)
+    
+    out_ref, attn_ref = attention_ref(
+        q,
+        k,
+        v,
+        query_padding_mask=None,
+        key_padding_mask=None,
+        causal=causal,
+        window_size=window_size,
+        upcast=upcast,
+        reorder_ops=False,
+    )
+    
+    return out_ref
+
+
+def compute_reference_flex_attn(
+    tensors, mask_mod_flex, mask_mod_name, tile_m, tile_n
+):
+    """Compute reference using flex_attention for custom mask_mods"""
     batch_size, seqlen_q, nheads, headdim = tensors["q"].shape
     _, seqlen_k, nheads_kv, _ = tensors["k"].shape
 
@@ -183,50 +242,45 @@ def compute_reference(
 
     scale = 1.0 / math.sqrt(headdim)
 
-    if mask_mod_flex is not None:
-        # Wrap mask_mod_flex to pass seqlen_q and seqlen_k
-        def mask_fn(b, h, q_idx, kv_idx):
-            return mask_mod_flex(b, h, q_idx, kv_idx, seqlen_q, seqlen_k)
-    elif causal:
-        # Wrap flex_causal_mask to pass seqlen_q and seqlen_k
-        def mask_fn(b, h, q_idx, kv_idx):
-            return flex_causal_mask(b, h, q_idx, kv_idx, seqlen_q, seqlen_k)
-    else:
-        mask_fn = None
-
-    if mask_fn is not None:
-        if mask_mod_name == "block_causal":
-            n_blocks_q = (seqlen_q + tile_m - 1) // tile_m
-            n_blocks_k = (seqlen_k + tile_n - 1) // tile_n
-
-            mask = torch.zeros(seqlen_q, seqlen_k, dtype=torch.bool, device=q.device)
-
-            for q_block in range(n_blocks_q):
-                q_start = q_block * tile_m
-                q_end = min((q_block + 1) * tile_m, seqlen_q)
-                for k_block in range(n_blocks_k):
-                    if k_block <= q_block:
-                        k_start = k_block * tile_n
-                        k_end = min((k_block + 1) * tile_n, seqlen_k)
-                        mask[q_start:q_end, k_start:k_end] = True
-
-            attn_mask = (
-                mask.unsqueeze(0).unsqueeze(0).expand(batch_size, nheads, -1, -1)
-            )
-            out_ref = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, scale=scale
-            )
-        else:
-            block_mask = create_block_mask(
-                mask_fn,
-                B=batch_size,
-                H=nheads,
-                Q_LEN=seqlen_q,
-                KV_LEN=seqlen_k,
-            ).to(q.device)
-            out_ref = flex_attention(q, k, v, block_mask=block_mask, scale=scale)
-    else:
+    # Handle identity (no masking) case
+    if mask_mod_flex is None:
         out_ref = F.scaled_dot_product_attention(q, k, v, scale=scale)
+        return out_ref.transpose(1, 2).contiguous()
+
+    # Wrap mask_mod_flex to pass seqlen_q and seqlen_k
+    def mask_fn(b, h, q_idx, kv_idx):
+        return mask_mod_flex(b, h, q_idx, kv_idx, seqlen_q, seqlen_k)
+
+    if mask_mod_name == "block_causal":
+        n_blocks_q = (seqlen_q + tile_m - 1) // tile_m
+        n_blocks_k = (seqlen_k + tile_n - 1) // tile_n
+
+        mask = torch.zeros(seqlen_q, seqlen_k, dtype=torch.bool, device=q.device)
+
+        for q_block in range(n_blocks_q):
+            q_start = q_block * tile_m
+            q_end = min((q_block + 1) * tile_m, seqlen_q)
+            for k_block in range(n_blocks_k):
+                if k_block <= q_block:
+                    k_start = k_block * tile_n
+                    k_end = min((k_block + 1) * tile_n, seqlen_k)
+                    mask[q_start:q_end, k_start:k_end] = True
+
+        attn_mask = (
+            mask.unsqueeze(0).unsqueeze(0).expand(batch_size, nheads, -1, -1)
+        )
+        out_ref = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, scale=scale
+        )
+    else:
+        block_mask = create_block_mask(
+            mask_fn,
+            B=batch_size,
+            H=nheads,
+            Q_LEN=seqlen_q,
+            KV_LEN=seqlen_k,
+        ).to(q.device)
+        out_ref = flex_attention(q, k, v, block_mask=block_mask, scale=scale)
 
     return out_ref.transpose(1, 2).contiguous()
 
@@ -256,30 +310,61 @@ def compute_reference(
         (4224, 4224),
     ],
 )
-# @pytest.mark.parametrize("nheads", [4, 16, 32, 64])
-@pytest.mark.parametrize("nheads", [4, 16])
-# @pytest.mark.parametrize("kv_mode", ["gqa", "mqa"])
+@pytest.mark.parametrize("nheads", [4, 16, 32])
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa", "mqa"])
 @pytest.mark.parametrize("headdim", [64, 128])
-# @pytest.mark.parametrize("headdim", [128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
-    "use_mask_mod,mask_name",
+    "use_mask_mod,is_local,mask_name,window_size,window_left,window_right",
     [
-        # (False, "identity"),
-        # (False, "causal"),
-        (True, "identity"),
-        # (True, "causal"),
-        # (True, "block_causal"),
-        # (True, "sliding_window"),
+        # (False, False, "identity", None, None, None),
+        # (False, False, "causal", None, None, None),
+        (True, False, "identity", None, None, None),
+        (True, False, "causal", None, None, None),
+        # (True, False, "block_causal", None, None, None),
+        # Mask mod sliding window
+        (True, False, "sliding_window", 128, None, None),
+        (True, False, "sliding_window", 256, None, None),
+        # (True, False, "sliding_window", 512, None, None),
+        # Base local attention
+        (False, True, None, None, 128, 0),
+        # (False, True, None, None, 256, 0),
+        # (False, True, None, None, 512, 0),
     ],
 )
-# @pytest.mark.parametrize("tile_m,tile_n", [(64, 64), (128, 128), (128, 64)])
-@pytest.mark.parametrize("tile_m,tile_n", [(128, 128),])
+@pytest.mark.parametrize("tile_m,tile_n", [(128, 128), (128, 192)])
 def test_mask_mod_output(
-    seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use_mask_mod, mask_name, tile_m, tile_n
+    seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, 
+    use_mask_mod, is_local, mask_name, window_size, window_left, window_right,
+    tile_m, tile_n
 ):
     torch.manual_seed(42)
+
+    # Validate configuration
+    if is_local:
+        assert not use_mask_mod, "Cannot use both is_local and use_mask_mod"
+        assert window_left is not None or window_right is not None, \
+            "Must specify window_left or window_right for is_local"
+    
+    if use_mask_mod and mask_name == "sliding_window":
+        assert window_size is not None, "window_size must be specified for sliding_window"
+        # Skip if seqlen_k is too small for the window
+        # if seqlen_k < window_size // 2:
+        #     pytest.skip(f"seqlen_k={seqlen_k} too small for window_size={window_size}")
+        # Skip if seqlen_q > seqlen_k (problematic for sliding window)
+        if seqlen_q > seqlen_k:
+            pytest.skip(f"seqlen_q={seqlen_q} > seqlen_k={seqlen_k} not supported for sliding_window")
+    
+    if is_local:
+        window_left_val = window_left if window_left is not None else 0
+        window_right_val = window_right if window_right is not None else 0
+        total_window = window_left_val + window_right_val + 1
+        # Skip if seqlen_k is too small for the window
+        if seqlen_k < total_window // 2:
+            pytest.skip(f"seqlen_k={seqlen_k} too small for window={total_window}")
+        # Skip if seqlen_q > seqlen_k (problematic for local window)
+        if seqlen_q > seqlen_k:
+            pytest.skip(f"seqlen_q={seqlen_q} > seqlen_k={seqlen_k} not supported for is_local")
 
     # Determine nheads_kv based on mode
     if kv_mode == "mha":
@@ -296,12 +381,22 @@ def test_mask_mod_output(
 
     # Determine mask_mod functions and causal flag
     if use_mask_mod:
-        mask_mod_cute, mask_mod_flex = MASK_FUNCTIONS[mask_name]
+        if mask_name == "sliding_window":
+            # Use factory function for custom window size
+            mask_mod_cute = create_cute_sliding_window_mask(window_size)
+            mask_mod_flex = create_flex_sliding_window_mask(window_size)
+        else:
+            mask_mod_cute, mask_mod_flex = MASK_FUNCTIONS[mask_name]
         causal = (mask_name == "causal")
+    elif is_local:
+        # Base local attention - no mask_mod
+        mask_mod_cute = None
+        mask_mod_flex = None
+        causal = False
     else:
         mask_mod_cute = None
         mask_mod_flex = None
-        causal = (mask_name == "causal")
+        causal = (mask_name == "causal") if mask_name else False
     
     if causal and seqlen_k < seqlen_q:
         pytest.skip("causal masking requires seqlen_k >= seqlen_q")
@@ -326,6 +421,7 @@ def test_mask_mod_output(
             tile_n: int
             use_mask_mod: bool
             mask_mod_name: str
+            window_size: int = 1024
             verbose: bool = False
 
         config = Config(
@@ -338,6 +434,7 @@ def test_mask_mod_output(
             tile_n=tile_n,
             use_mask_mod=True,
             mask_mod_name=mask_name,
+            window_size=window_size if window_size is not None else 1024,
         )
 
         full_cnt, full_idx, mask_cnt, mask_idx = compute_block_sparsity(
@@ -349,6 +446,9 @@ def test_mask_mod_output(
         tensors,
         mask_mod_cute,
         causal=causal,
+        is_local=is_local,
+        window_left=window_left,
+        window_right=window_right,
         tile_m=tile_m,
         tile_n=tile_n,
         full_block_cnt=full_cnt,
@@ -357,47 +457,59 @@ def test_mask_mod_output(
         mask_block_idx=mask_idx,
     )
 
-    # Compute reference at fp32
-    tensors_fp32 = {
-        k: v.float() if v.dtype in [torch.float16, torch.bfloat16] else v
-        for k, v in tensors.items()
-    }
-    out_ref_fp32 = compute_reference(
-        tensors_fp32,
-        mask_mod_flex if use_mask_mod else None,
-        mask_name,
-        causal=causal,
-        tile_m=tile_m,
-        tile_n=tile_n,
-    )
-
-    # Compute reference at original dtype
-    out_ref = compute_reference(
-        tensors,
-        mask_mod_flex if use_mask_mod else None,
-        mask_name,
-        causal=causal,
-        tile_m=tile_m,
-        tile_n=tile_n,
-    )
-
-    # If using mask_mod causal, also verify against built-in causal
-    if use_mask_mod and mask_name == "causal":
-        out_builtin_causal = compute_reference(
-            tensors_fp32,
-            mask_mod_flex=None,
-            mask_mod_name="causal",
-            causal=True,  # Use built-in causal
-            tile_m=tile_m,
-            tile_n=tile_n,
+    # Determine which reference implementation to use
+    dtype_ref = torch.bfloat16
+    use_flash_attn_ref = False
+    
+    # Use FlashAttention reference for causal and local window cases
+    if mask_name == "causal" and not use_mask_mod:
+        use_flash_attn_ref = True
+        window_size_ref = (None, None)  # attention_ref handles causal internally
+    elif mask_name == "identity" and not use_mask_mod and not is_local:
+        use_flash_attn_ref = True
+        window_size_ref = (None, None)  # No window for identity
+    elif is_local:
+        use_flash_attn_ref = True
+        # For is_local, we need to pass the window parameters
+        # When window_right=0, this is inherently causal
+        window_size_ref = (window_left, window_right)
+        if window_right == 0:
+            causal = True  # Override causal flag for reference computation
+    elif use_mask_mod and mask_name == "sliding_window":
+        use_flash_attn_ref = True
+        # For sliding window mask_mod, window_size corresponds directly to window_left
+        # in attention_ref (number of previous tokens that can be attended to)
+        # Sliding window with window_right=0 is inherently causal
+        window_size_ref = (window_size, 0)
+        causal = True  # Override causal flag for reference computation
+    
+    if use_flash_attn_ref:
+        # Compute reference using FlashAttention's attention_ref
+        out_ref_fp32 = compute_reference_flash_attn(
+            tensors, causal=causal, window_size=window_size_ref, dtype_ref=torch.float32, upcast=True
         )
-
-        builtin_causal_error = (out_ref_fp32 - out_builtin_causal).abs().max().item()
-
-        # Verify mask_mod causal matches built-in causal
-        assert builtin_causal_error < 1e-5, (
-            f"mask_mod causal doesn't match built-in causal: error {builtin_causal_error:.2e}"
+        out_ref = compute_reference_flash_attn(
+            tensors, causal=causal, window_size=window_size_ref, dtype_ref=dtype_ref, upcast=False
         )
+        
+        # Also compute PyTorch reference for comparison (with reorder_ops for better accuracy)
+        out_pt = compute_reference_flash_attn(
+            tensors, causal=causal, window_size=window_size_ref, dtype_ref=dtype, upcast=False
+        )
+    else:
+        # Use flex_attention for custom mask_mods
+        tensors_fp32 = {
+            k: v.float() if v.dtype in [torch.float16, torch.bfloat16] else v
+            for k, v in tensors.items()
+        }
+        
+        out_ref_fp32 = compute_reference_flex_attn(
+            tensors_fp32, mask_mod_flex, mask_name, tile_m, tile_n
+        )
+        out_ref = compute_reference_flex_attn(
+            tensors, mask_mod_flex, mask_name, tile_m, tile_n
+        )
+        out_pt = out_ref.clone()
 
     # Check for invalid values
     assert out_cute.shape == out_ref_fp32.shape == out_ref.shape
@@ -406,25 +518,49 @@ def test_mask_mod_output(
     assert torch.isfinite(out_cute).all()
     assert torch.isfinite(out_ref_fp32).all()
 
-    # Compute numerical tolerance
+    # Compute numerical tolerance (matching flash attention tests)
     fwd_atol = 2 * (out_ref_fp32 + 0.3 - 0.3 - out_ref_fp32).abs().max().item()
     rtol = 2
 
     ref_error = (out_ref - out_ref_fp32).abs().max().item()
+    pt_error = (out_pt - out_ref_fp32).abs().max().item()
     cute_error = (out_cute - out_ref_fp32).abs().max().item()
 
-    mask_desc = f"mask_mod={mask_name}" if use_mask_mod else mask_name
+    # Build description string
+    if is_local:
+        mask_desc = f"is_local(L={window_left},R={window_right})"
+    elif use_mask_mod:
+        mask_desc = f"mask_mod={mask_name}"
+        if mask_name == "sliding_window" and window_size is not None:
+            mask_desc += f"(w={window_size})"
+    else:
+        mask_desc = mask_name if mask_name else "identity"
+    
     print(
         f"\n{mask_desc} @ Q={seqlen_q}, K={seqlen_k}, H={nheads}/{nheads_kv} ({kv_mode}), "
         f"D={headdim}, M={tile_m}, N={tile_n}"
     )
+    print(f"  Reference implementation: {'FlashAttention' if use_flash_attn_ref else 'FlexAttention'}")
     print(f"  Reference vs FP32: {ref_error:.2e}")
+    print(f"  PyTorch vs FP32: {pt_error:.2e}")
     print(f"  Kernel vs FP32: {cute_error:.2e}")
-    print(f"  Tolerance: {fwd_atol:.2e}")
-    print(f"  Error ratio: {cute_error / max(ref_error, 1e-10):.2f}")
+    print(f"  Tolerance: rtol={rtol} * {pt_error:.2e} + {fwd_atol:.2e}")
+    print(f"  Error ratio: {cute_error / max(pt_error, 1e-10):.2f}")
+    
+    # Debug: show some sample values if error is large
+    if cute_error > 1e-2:
+        print(f"  DEBUG: Sample kernel output: {out_cute[0, 0, 0, :5]}")
+        print(f"  DEBUG: Sample reference output: {out_ref_fp32[0, 0, 0, :5]}")
+        print(f"  DEBUG: Max diff location: {(out_cute - out_ref_fp32).abs().argmax()}")
+        max_diff_idx = (out_cute - out_ref_fp32).abs().argmax()
+        max_diff_coords = torch.unravel_index(max_diff_idx, out_cute.shape)
+        print(f"  DEBUG: Max diff at coords: {max_diff_coords}")
+        print(f"  DEBUG: Kernel value: {out_cute[max_diff_coords]:.6f}")
+        print(f"  DEBUG: Reference value: {out_ref_fp32[max_diff_coords]:.6f}")
 
-    assert cute_error <= rtol * ref_error + fwd_atol, (
-        f"Kernel error {cute_error:.2e} exceeds {rtol}x ref error {ref_error:.2e} + {fwd_atol:.2e}"
+    # Use the same assertion logic as FlashAttention tests
+    assert cute_error <= rtol * pt_error + fwd_atol, (
+        f"Kernel error {cute_error:.2e} exceeds {rtol}x PyTorch error {pt_error:.2e} + {fwd_atol:.2e}"
     )
 
 

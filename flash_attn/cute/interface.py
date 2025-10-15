@@ -230,7 +230,8 @@ def _flash_attn_fwd(
         # TODO: fix the varlen case
         if pack_gqa and (128 % qhead_per_kvhead != 0) or (cu_seqlens_q is not None or seqused_q is not None):
             pack_gqa = False
-            
+    
+    # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else None
     mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else None
     
