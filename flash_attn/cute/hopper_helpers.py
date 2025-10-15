@@ -101,4 +101,3 @@ def make_smem_layout(
     )
     return smem_layout_staged
 
-
