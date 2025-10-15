@@ -481,6 +481,15 @@ class FlashAttentionForwardSm100:
             window_size_left = Int32(window_size_left)
         if const_expr(window_size_right is not None):
             window_size_right = Int32(window_size_right)
+
+        fastdiv_mods = None
+        if cutlass.const_expr(buffers is not None):
+            seqlen_q = cute.size(mQ.shape[0]) // (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
+            seqlen_k = cute.size(mK.shape[0])
+            seqlen_q_divmod = FastDivmod.create(seqlen_q)
+            seqlen_k_divmod = FastDivmod.create(seqlen_k)
+            fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
+
         # Launch the kernel synchronously
         self.kernel(
             tma_tensor_Q,
@@ -1907,3 +1916,54 @@ class FlashAttentionForwardSm100:
     #     cute.arch.barrier_arrive(
     #         barrier_id=int(NamedBarrierFwd.WarpSchedulerWG1) + next_wg, number_of_threads=2 * 128,
     #     )
+
+    @cute.jit
+    def apply_score_mod(
+        self,
+        tSrS_t2r,
+        thr_tmem_load,
+        thr_mma_qk,
+        batch_idx,
+        head_idx,
+        m_block,
+        n_block,
+        softmax,
+        buffers=None,
+        fastdiv_mods=(None, None),
+    ):
+        """Apply score modification for SM100 (constant q_idx)."""
+        # Prepare index tensor with extra partition
+        cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
+        cS = cute.domain_offset((m_block * self.m_block_size, n_block * self.n_block_size), cS)
+        tScS = thr_mma_qk.partition_C(cS)
+        tScS_t2r = thr_tmem_load.partition_D(tScS)
+
+        # Shared q_idx for all scores
+        q_idx_logical = tScS_t2r[0][0]
+
+        # For Pack-GQA, compute the logical head index for this tile
+        if cutlass.const_expr(self.pack_gqa):
+            # Building up the logical q_head idx: final_q_head = kv_head * qhead_per_kvhead + (q_physical % qhead_per_kvhead)
+            q_physical = q_idx_logical
+            q_idx_logical = q_physical // self.qhead_per_kvhead
+            head_offset = q_physical - q_idx_logical * self.qhead_per_kvhead
+            head_idx = head_idx * self.qhead_per_kvhead + head_offset
+
+        if cutlass.const_expr(buffers is not None):
+            seqlen_q_divmod, _ = fastdiv_mods
+            _, q_idx_logical = seqlen_q_divmod.divmod(q_idx_logical)
+
+        apply_score_mod_inner(
+            tSrS_t2r,
+            tScS_t2r,
+            self.score_mod,
+            batch_idx,
+            head_idx,
+            softmax.softmax_scale,
+            self.vec_size,
+            self.qk_acc_dtype,
+            buffers,
+            fastdiv_mods,
+            constant_q_idx=q_idx_logical,
+            qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
+        )

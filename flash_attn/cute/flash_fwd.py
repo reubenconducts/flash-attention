@@ -36,22 +36,6 @@ from flash_attn.cute.tile_scheduler import TileSchedulerArguments, SingleTileSch
 from flash_attn.cute.fast_math import FastDivmod
 
 
-def mma_qk(tiled_mma_qk: cute.TiledMma, shape: cute.Shape, tSrQ: cute.Tensor, tSrK: cute.Tensor, smem_idx: Int32, wg_wait: int = -1) -> cute.Tensor:
-    acc_S = cute.make_fragment(tiled_mma_qk.partition_shape_C(shape), Float32)
-    sm90_utils.gemm(
-        tiled_mma_qk, acc_S, tSrQ, tSrK[None, None, None, smem_idx], zero_init=True, wg_wait=wg_wait
-    )
-    return acc_S
-
-
-def mma_pv(tiled_mma_pv: cute.TiledMma, acc_O: cute.Tensor, tOrP: cute.Tensor, tOrVt: cute.Tensor, smem_idx: Int32, zero_init: Boolean, wg_wait: int = -1) -> None:
-    sm90_utils.gemm(
-        tiled_mma_pv, acc_O, tOrP,
-        tOrVt[None, None, None, smem_idx],
-        zero_init=zero_init, wg_wait=wg_wait
-    )
-
-
 class FlashAttentionForwardBase:
 
     arch: int = 80
@@ -622,7 +606,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
 
         fastdiv_mods = None
         if cutlass.const_expr(buffers is not None):
-            seqlen_q = cute.size(mQ.shape[0])
+            seqlen_q = cute.size(mQ.shape[0]) // (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
             seqlen_k = cute.size(mK.shape[0])
             seqlen_q_divmod = FastDivmod.create(seqlen_q)
             seqlen_k_divmod = FastDivmod.create(seqlen_k)
@@ -1285,7 +1269,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         fastdiv_mods = None
         if cutlass.const_expr(buffers is not None):
-            seqlen_q = cute.size(mQ.shape[0])
+            seqlen_q = cute.size(mQ.shape[0]) // (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
             seqlen_k = cute.size(mK.shape[0])
             seqlen_q_divmod = FastDivmod.create(seqlen_q)
             seqlen_k_divmod = FastDivmod.create(seqlen_k)
@@ -1697,8 +1681,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         acc_O = cute.make_fragment(acc_shape_O, Float32)
         smem_copy_params = SimpleNamespace(smem_thr_copy_P=smem_thr_copy_P, tPsP=tPsP)
 
-        mma_qk_fn = partial(mma_qk, tiled_mma_qk, (self.tile_m, self.tile_n), tSrQ, tSrK)
-        mma_pv_fn = partial(mma_pv, tiled_mma_pv, acc_O, tOrP, tOrVt)
+        mma_qk_fn = partial(
+            sm90_utils.gemm_zero_init, tiled_mma_qk, (self.tile_m, self.tile_n), tSrQ, tSrK
+        )
+        mma_pv_fn = partial(sm90_utils.gemm_w_idx, tiled_mma_pv, acc_O, tOrP, tOrVt)
 
         mma_one_n_block_all = partial(
             self.mma_one_n_block_intrawg_overlap if const_expr(self.intra_wg_overlap) else self.mma_one_n_block,
@@ -2158,7 +2144,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         check_inf: cutlass.Constexpr = True,
     ):
         pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
-        acc_S = mma_qk_fn(smem_pipe_read.index, wg_wait=-1)
+        # S = Q @ K.T
+        acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
         self.warp_scheduler_barrier_arrive()
         warpgroup.wait_group(0)
         pipeline_k.consumer_release(smem_pipe_read)
@@ -2190,7 +2177,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
         pipeline_v.consumer_wait(smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read))
         self.warp_scheduler_barrier_sync()
-        mma_pv_fn(smem_pipe_read.index, wg_wait=0)
+        # O += P @ V
+        mma_pv_fn(B_idx=smem_pipe_read.index, wg_wait=0)
         pipeline_v.consumer_release(smem_pipe_read)
         smem_pipe_read.advance()
         return smem_pipe_read
@@ -2217,9 +2205,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         smem_pipe_read.advance()
         pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
         self.warp_scheduler_barrier_sync()
-        acc_S = mma_qk_fn(smem_pipe_read.index, wg_wait=-1)
+        # S = Q @ K.T
+        acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
         pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v))
-        mma_pv_fn(smem_pipe_read_v.index, wg_wait=-1)
+        # O += P @ V
+        mma_pv_fn(B_idx=smem_pipe_read_v.index, wg_wait=-1)
         self.warp_scheduler_barrier_arrive()
         warpgroup.wait_group(1)
         pipeline_k.consumer_release(smem_pipe_read)
@@ -2291,7 +2281,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.qk_acc_dtype,
             buffers,
             fastdiv_mods,
-            constant_q_idx=None
+            constant_q_idx=None,
+            qhead_per_kvhead=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
 
     def warp_scheduler_barrier_sync(self):

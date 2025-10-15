@@ -3,7 +3,7 @@
 # from Cutlass C++ to Cute-DSL.
 import math
 import operator
-from typing import Type, Optional
+from typing import Callable, Type, Optional
 
 import cuda.bindings.driver as cuda
 
@@ -130,12 +130,14 @@ class FlashAttentionBackwardPreprocess:
         mLSE: Optional[cute.Tensor],
         mLSElog2: Optional[cute.Tensor],
         mdQaccum: Optional[cute.Tensor],
+        mCuSeqlensQ: Optional[cute.Tensor],
+        mSeqUsedQ: Optional[cute.Tensor],
         stream: cuda.CUstream,
     ):
         # Get the data type and check if it is fp16 or bf16
         if cutlass.const_expr(not (mO.element_type == mdO.element_type)):
             raise TypeError("All tensors must have the same data type")
-        if cutlass.const_expr(not mO.element_type in [cutlass.Float16, cutlass.BFloat16]):
+        if cutlass.const_expr(mO.element_type not in [cutlass.Float16, cutlass.BFloat16]):
             raise TypeError("Only Float16 or BFloat16 is supported")
         if cutlass.const_expr(not mdPsum.element_type in [cutlass.Float32]):
             raise TypeError("dPsum tensor must be Float32")
@@ -151,12 +153,31 @@ class FlashAttentionBackwardPreprocess:
 
         self._setup_attributes()
 
-        # grid_dim: (m_block, num_head, batch_size)
-        grid_dim = (
-            cute.ceil_div(mO.shape[1], self.m_block_size),
-            cute.size(mO.shape[2]),
-            cute.size(mO.shape[0]),
+        if cutlass.const_expr(mCuSeqlensQ is not None):
+            TileScheduler = SingleTileVarlenScheduler
+            num_head = mO.shape[1]
+            num_batch = mCuSeqlensQ.shape[0] - 1
+        else:
+            TileScheduler = SingleTileScheduler
+            num_head = mO.shape[2]
+            num_batch = mO.shape[0]
+
+        tile_sched_args = TileSchedulerArguments(
+            num_block=cute.ceil_div(mO.shape[1], self.m_block_size),
+            num_head=num_head,
+            num_batch=num_batch,
+            seqlen_k=0,
+            headdim=0,
+            headdim_v=mO.shape[2],
+            total_q=mO.shape[0],
+            tile_shape_mn=(self.m_block_size, 1),
+            mCuSeqlensQ=mCuSeqlensQ,
+            mSeqUsedQ=mSeqUsedQ,
         )
+
+        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
+        grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
+
         self.kernel(
             mO,
             mdO,
@@ -164,9 +185,13 @@ class FlashAttentionBackwardPreprocess:
             mLSE,
             mLSElog2,
             mdQaccum,
+            mCuSeqlensQ,
+            mSeqUsedQ,
             self.gmem_tiled_copy_O,
             self.gmem_tiled_copy_dO,
             self.gmem_tiled_copy_dQaccum,
+            tile_sched_params,
+            TileScheduler,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -182,21 +207,20 @@ class FlashAttentionBackwardPreprocess:
         mLSE: Optional[cute.Tensor],
         mLSElog2: Optional[cute.Tensor],
         mdQaccum: Optional[cute.Tensor],
+        mCuSeqlensQ: Optional[cute.Tensor],
+        mSeqUsedQ: Optional[cute.Tensor],
         gmem_tiled_copy_O: cute.TiledCopy,
         gmem_tiled_copy_dO: cute.TiledCopy,
         gmem_tiled_copy_dQaccum: cute.TiledCopy,
+        tile_sched_params: ParamsBase,
+        TileScheduler: cutlass.Constexpr[Callable],
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
-        m_block, num_head, batch_size = cute.arch.block_idx()
 
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Get the appropriate tiles for this thread block.
-        # ///////////////////////////////////////////////////////////////////////////////
-        blkOdO_shape = (self.m_block_size, self.head_dim_padded)
-        # (m_block_size, head_dim)
-        gO = cute.local_tile(mO[batch_size, None, num_head, None], blkOdO_shape, (m_block, 0))
-        gdO = cute.local_tile(mdO[batch_size, None, num_head, None], blkOdO_shape, (m_block, 0))
+        tile_scheduler = TileScheduler.create(tile_sched_params)
+        work_tile = tile_scheduler.initial_work_tile_info()
+        m_block, num_head, batch_size = work_tile.tile_idx
 
         gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
         gmem_thr_copy_dO = gmem_tiled_copy_dO.get_slice(tidx)
@@ -217,8 +241,9 @@ class FlashAttentionBackwardPreprocess:
         t0OcdO = gmem_thr_copy_dO.get_slice(0).partition_S(cOdO)
         tOpdO = utils.predicate_k(tOcdO, limit=mdO.shape[3])
 
-        seqlen_q = mO.shape[1]
-        seqlen_q_rounded = cute.round_up(seqlen_q, self.m_block_size)
+                padded_offset_q = seqlen.offset_q + batch_size * self.m_block_size
+                mdPsum_cur = cute.domain_offset((padded_offset_q,), mdPsum[num_head, None])
+                headdim_v = mO.shape[2]
 
         if cutlass.const_expr(mLSE is not None):
             gLSE = cute.local_tile(
@@ -267,21 +292,64 @@ class FlashAttentionBackwardPreprocess:
                 row = tOcO[0, m, 0][0]
                 gdPsum[row] = dP_sum[m] if row < mO.shape[1] - m_block * self.m_block_size else 0.0
 
-        # Clear dQaccum
-        if cutlass.const_expr(mdQaccum is not None):
-            blkdQaccum_shape = (self.m_block_size * self.head_dim_padded,)
-            gdQaccum = cute.local_tile(
-                mdQaccum[batch_size, num_head, None], blkdQaccum_shape, (m_block,)
-            )
-            gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_slice(tidx)
-            tQgQaccum = gmem_thr_copy_dQaccum.partition_S(gdQaccum)
-            zero = cute.make_fragment_like(tQgQaccum)
-            zero.fill(0.0)
-            cute.copy(gmem_tiled_copy_dQaccum, zero, tQgQaccum)
+            gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
+            # (CPY_Atom, CPY_M, CPY_K)
+            tOgO = gmem_thr_copy_O.partition_S(gO)
+            tOgdO = gmem_thr_copy_O.partition_S(gdO)
 
-        if cutlass.const_expr(mLSE is not None):
-            gLSElog2 = cute.local_tile(
-                mLSElog2[batch_size, num_head, None], (self.m_block_size,), (m_block,)
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Predicate: Mark indices that need to copy when problem_shape isn't a multiple
+            # of tile_shape
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Construct identity layout for KV
+            cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
+            tOcO = gmem_thr_copy_O.partition_S(cO)
+            t0OcO = gmem_thr_copy_O.get_slice(0).partition_S(cO)
+            tOpO = utils.predicate_k(tOcO, limit=headdim_v)
+            tOpdO = utils.predicate_k(tOcO, limit=headdim_v)
+
+            seqlen_q = seqlen.seqlen_q
+            seqlen_q_rounded = cute.round_up(seqlen_q, self.m_block_size)
+
+            if cutlass.const_expr(mLSE is not None):
+                if cutlass.const_expr(not seqlen.has_cu_seqlens_q):
+                    mLSE_cur = mLSE[batch_size, num_head, None]
+                else:
+                    mLSE_cur = cute.domain_offset((seqlen.offset_q,), mLSE[num_head, None])
+
+                gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_block,))
+                lse = Float32.inf
+                if tidx < seqlen_q - m_block * self.m_block_size:
+                    lse = gLSE[tidx]
+
+            tOrO = cute.make_fragment_like(tOgO)
+            tOrdO = cute.make_fragment_like(tOgdO)
+            assert cute.size(tOgO, mode=[0]) == cute.size(tOgdO, mode=[0])
+            assert cute.size(tOgO, mode=[1]) == cute.size(tOgdO, mode=[1])
+            assert cute.size(tOgO, mode=[2]) == cute.size(tOgdO, mode=[2])
+            for m in cutlass.range(cute.size(tOrO.shape[1]), unroll_full=True):
+                # Instead of using tOcO, we using t0OcO and subtract the offset from the limit
+                # (seqlen_q - m_block * kBlockM). This is because the entries of t0OcO are known at compile time.
+                if t0OcO[0, m, 0][0] < seqlen_q - m_block * self.m_block_size - tOcO[0][0]:
+                    cute.copy(
+                        gmem_thr_copy_O,
+                        tOgO[None, m, None],
+                        tOrO[None, m, None],
+                        pred=tOpO[None, m, None]
+                        if cutlass.const_expr(self.check_hdim_oob)
+                        else None,
+                    )
+                    cute.copy(
+                        gmem_thr_copy_O,
+                        tOgdO[None, m, None],
+                        tOrdO[None, m, None],
+                        pred=tOpdO[None, m, None]
+                        if cutlass.const_expr(self.check_hdim_oob)
+                        else None,
+                    )
+            # Sum across the "k" dimension
+            dpsum = (tOrO.load().to(Float32) * tOrdO.load().to(Float32)).reduce(
+                cute.ReductionOp.ADD, init_val=0.0, reduction_profile=(0, None, 1)
             )
             LOG2_E = math.log2(math.e)
             if tidx < seqlen_q_rounded - m_block * self.m_block_size:
