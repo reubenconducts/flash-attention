@@ -1049,6 +1049,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         batch_idx: cutlass.Int32,
         head_idx: cutlass.Int32,
         m_block: cutlass.Int32,
+        seqlen: SeqlenInfoQK,
         aux_tensors=None,
         fastdiv_mods=None,
         mask_fn: Optional[Callable] = None,
@@ -1104,6 +1105,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 m_block,
                 acc_S,
                 n_block,
+                seqlen,
                 softmax_scale=softmax.softmax_scale,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
@@ -2000,6 +2002,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     batch_idx,
                     head_idx,
                     m_block,
+                    seqlen,
                     softmax_scale=softmax_scale,
                     aux_tensors=aux_tensors,
                     fastdiv_mods=fastdiv_mods,
@@ -2135,7 +2138,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     self.warp_scheduler_barrier_sync,
                     self.warp_scheduler_barrier_arrive,
                 )
-                
+
                 # Handle empty case (when no blocks to process)
                 if not processed_any:
                     softmax.reset()
@@ -2388,6 +2391,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         acc_S,
         n_block,
         softmax_scale,
+        seqlen,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=None,
     ):
@@ -2407,6 +2411,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.qk_acc_dtype,
             aux_tensors,
             fastdiv_mods,
+            seqlen,
             constant_q_idx=None,
             qhead_per_kvhead=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
