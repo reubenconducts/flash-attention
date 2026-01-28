@@ -40,6 +40,12 @@ def score_mod_rel_bias_x2(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, au
 def score_mod_times_two(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     return tSrS_ssa * cute.full_like(tSrS_ssa, 2)
 
+<<<<<<< Updated upstream
+=======
+
+score_mod_times_two_vectorized = score_mod_times_two
+>>>>>>> Stashed changes
+
 
 @cute.jit
 def score_mod_alibi(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
@@ -53,6 +59,25 @@ def score_mod_alibi(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tens
     abs_diff = cute.TensorSSA(mlir_math.absi(diff), diff.shape, diff.dtype).to(cutlass.Float32)
     return score - slope * abs_diff
 
+<<<<<<< Updated upstream
+=======
+
+@cute.jit
+def score_mod_alibi_vectorized(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    score = tSrS_ssa.to(cutlass.Float32)
+    slope_exp = (h_idx + cute.full_like(h_idx, 1)) * cute.full_like(h_idx, -8)
+    slope = cute.math.exp2(
+        slope_exp.to(cutlass.Float32)
+        * cute.full_like(score, 0.125 * 0.6931471805599453 * 1.4426950408889634)
+    )
+    diff0 = q_idx[0] - kv_idx[0]
+    abs_diff = cute.make_rmem_tensor(kv_idx.shape, diff0.dtype)
+    for i in cutlass.range_constexpr(cute.size(abs_diff.shape)):
+        diffi = diff0 - i
+        abs_diff[i] = mlir_math.absi(diffi)
+    return score - slope * abs_diff.load().to(cutlass.Float32)
+
+>>>>>>> Stashed changes
 
 @cute.jit
 def score_mod_sliding_window(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
@@ -88,6 +113,22 @@ def score_mod_batch_bias(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux
     bias_val = (bias_frag.load()).to(cutlass.Float32)
     return tSrS_ssa + bias_val
 
+<<<<<<< Updated upstream
+=======
+
+@cute.jit
+def score_mod_batch_bias_vectorized(
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
+    batch_bias = aux_tensors[0]
+    dtype = batch_bias.element_type
+    b_idx0 = b_idx[0]
+    bias_frag = cute.make_rmem_tensor(1, dtype)
+    bias_frag[0] = batch_bias[b_idx0]
+    bias_val = (bias_frag.load()).to(cutlass.Float32)
+    return tSrS_ssa + bias_val
+
+>>>>>>> Stashed changes
 
 @cute.jit
 def score_mod_dual_buffer(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
@@ -109,6 +150,28 @@ def score_mod_dual_buffer(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, au
 
     return tSrS_ssa + head_val + pos_val
 
+<<<<<<< Updated upstream
+=======
+
+@cute.jit
+def score_mod_dual_buffer_vectorized(
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
+    head_bias = aux_tensors[0]
+    pos_bias = aux_tensors[1]
+    dtype = head_bias.element_type
+
+    head_val_frag = cute.make_fragment(1, dtype)
+    head_val_frag[0] = head_bias[h_idx[0]]
+    head_val = (head_val_frag.load()).to(cutlass.Float32)
+
+    pos_val_frag = cute.make_fragment(1, dtype)
+    pos_val_frag[0] = pos_bias[q_idx[0]]
+    pos_val = (pos_val_frag.load()).to(cutlass.Float32)
+
+    return tSrS_ssa + head_val + pos_val
+
+>>>>>>> Stashed changes
 
 # =============================================================================
 # Score_mod functions that use global indices
@@ -118,9 +181,7 @@ def score_mod_dual_buffer(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, au
 
 
 @cute.jit
-def score_mod_global_kv_bias(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
-):
+def score_mod_global_kv_bias(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     """Per-token bias using global kv index."""
     offset_k = seqlen_info.offset_k
     kv_idx_global = kv_idx + offset_k
@@ -135,9 +196,7 @@ def score_mod_global_kv_bias(
 
 
 @cute.jit
-def score_mod_global_q_bias(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
-):
+def score_mod_global_q_bias(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     """Per-token bias using global q index."""
     offset_q = seqlen_info.offset_q
     q_idx_global = q_idx + offset_q
@@ -173,9 +232,7 @@ def score_mod_global_rel_plus_kv_bias(
 
 
 @cute.jit
-def score_mod_global_q_and_kv_bias(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
-):
+def score_mod_global_q_and_kv_bias(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     """Both q and kv global indices."""
     offset_q = seqlen_info.offset_q
     q_idx_global = q_idx + offset_q
@@ -225,6 +282,7 @@ def score_mod_global_logical_rel_plus_kv_bias(
 
 
 # "Stress tests" - score_mods with complex global index usage
+
 
 @cute.jit
 def score_mod_stress_complex_arithmetic(
@@ -285,9 +343,7 @@ def score_mod_stress_conditional_mask(
 
 
 @cute.jit
-def score_mod_stress_multi_buffer(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
-):
+def score_mod_stress_multi_buffer(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     """Multiple aux tensors with different indexing."""
     offset_q = seqlen_info.offset_q
     q_idx_global = q_idx + offset_q
@@ -344,9 +400,7 @@ def score_mod_stress_multi_buffer(
 
 
 @cute.jit
-def score_mod_stress_global_offset(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
-):
+def score_mod_stress_global_offset(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     """Verify global - logical = offset."""
     offset_k = seqlen_info.offset_k
     kv_idx_global = kv_idx + offset_k
@@ -362,9 +416,7 @@ def score_mod_stress_global_offset(
 
 
 @cute.jit
-def score_mod_stress_xor_pattern(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
-):
+def score_mod_stress_xor_pattern(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     """XOR-based pattern using index bits."""
     offset_k = seqlen_info.offset_k
     kv_idx_global = kv_idx + offset_k
@@ -388,9 +440,7 @@ def score_mod_stress_xor_pattern(
 
 
 @cute.jit
-def score_mod_debug_global_idx(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
-):
+def score_mod_debug_global_idx(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     # Don't read from aux_tensors at all - just add the global index as bias
     offset_k = seqlen_info.offset_k
     kv_idx_global = kv_idx + offset_k
@@ -458,31 +508,33 @@ def packed_kv_bias_factory(bias_tensor, cu_seqlens_k):
     def mod(score, b, h, q_idx, kv_idx):
         # Calculate valid length for this sequence
         start = cu_seqlens_k[b]
-        seq_len = cu_seqlens_k[b+1] - start
+        seq_len = cu_seqlens_k[b + 1] - start
 
         # Clamp kv_idx.
         safe_kv_idx = torch.clamp(kv_idx, max=seq_len - 1)
 
         return score + bias_tensor[start + safe_kv_idx]
+
     return mod
 
 
 def packed_q_bias_factory(bias_tensor, cu_seqlens_q):
     def mod(score, b, h, q_idx, kv_idx):
         start = cu_seqlens_q[b]
-        seq_len = cu_seqlens_q[b+1] - start
+        seq_len = cu_seqlens_q[b + 1] - start
 
         # Clamp q_idx
         safe_q_idx = torch.clamp(q_idx, max=seq_len - 1)
 
         return score + bias_tensor[start + safe_q_idx]
+
     return mod
 
 
 def packed_rel_plus_kv_bias_factory(bias_tensor, cu_seqlens_k):
     def mod(score, b, h, q_idx, kv_idx):
         start = cu_seqlens_k[b]
-        seq_len = cu_seqlens_k[b+1] - start
+        seq_len = cu_seqlens_k[b + 1] - start
 
         # Clamp kv_idx
         safe_kv_idx = torch.clamp(kv_idx, max=seq_len - 1)
@@ -497,12 +549,12 @@ def packed_q_and_kv_bias_factory(q_bias, kv_bias, cu_seqlens_q, cu_seqlens_k):
     def mod(score, b, h, q_idx, kv_idx):
         # Handle Q bounds
         q_start = cu_seqlens_q[b]
-        q_len = cu_seqlens_q[b+1] - q_start
+        q_len = cu_seqlens_q[b + 1] - q_start
         safe_q_idx = torch.clamp(q_idx, max=q_len - 1)
 
         # Handle KV bounds
         kv_start = cu_seqlens_k[b]
-        kv_len = cu_seqlens_k[b+1] - kv_start
+        kv_len = cu_seqlens_k[b + 1] - kv_start
         safe_kv_idx = torch.clamp(kv_idx, max=kv_len - 1)
 
         return score + q_bias[q_start + safe_q_idx] + kv_bias[kv_start + safe_kv_idx]
@@ -583,9 +635,12 @@ def stress_xor_pattern_factory(token_bias, cu_seqlens_q, cu_seqlens_k):
 
     return mod
 
+
 def debug_global_idx_factory(bias, cu_seqlens_k):
     offsets = cu_seqlens_k.tolist()
+
     def mod(score, b, h, q_idx, kv_idx):
         global_kv = offsets[b] + kv_idx
         return score + global_kv.float() * 0.001
+
     return mod
