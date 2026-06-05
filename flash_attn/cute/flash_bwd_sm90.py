@@ -723,13 +723,13 @@ class FlashAttentionBackwardSm90:
         sdQaccum = storage.sdQaccum.get_tensor(sdQaccum_layout)
 
         block_info = BlockInfo(
-            self.tile_m,
-            self.tile_n,
-            self.is_causal,
-            self.is_local,
-            False,  # is_split_kv
-            window_size_left,
-            window_size_right,
+            tile_m=self.tile_m,
+            tile_n=self.tile_n,
+            is_causal=self.is_causal,
+            is_local=self.is_local,
+            is_split_kv=False,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
             qhead_per_kvhead_packgqa=1,
         )
         SeqlenInfoCls = partial(

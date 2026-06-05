@@ -309,6 +309,7 @@ def _flash_attn_fwd(
     softcap: Optional[float] = None,
     window_size_left: Optional[int] = None,
     window_size_right: Optional[int] = None,
+    num_sink_tokens: Optional[int] = None,
     learnable_sink: Optional[torch.Tensor] = None,
     tile_mn: Optional[Tuple[int, int]] = None,
     mma_pv_is_rs: Optional[bool] = None,
@@ -723,6 +724,7 @@ def _flash_attn_fwd(
         page_table is not None,
         window_size_left is not None,
         window_size_right is not None,
+        num_sink_tokens is not None,
         learnable_sink is not None,
         q_descale is not None,
         k_descale is not None,
@@ -923,6 +925,7 @@ def _flash_attn_fwd(
                     qhead_per_kvhead=qhead_per_kvhead,
                     is_causal=causal,
                     is_local=local,
+                    has_sink_tokens=num_sink_tokens is not None and num_sink_tokens!=0,
                     is_split_kv=is_split_kv,
                     pack_gqa=pack_gqa,
                     m_block_size=tile_m,
@@ -1008,6 +1011,7 @@ def _flash_attn_fwd(
                 page_table_tensor,
                 window_size_left,
                 window_size_right,
+                num_sink_tokens,
                 learnable_sink_tensor,
             ]
             if arch // 10 in [10, 11]:
@@ -1072,6 +1076,7 @@ def _flash_attn_fwd(
                 page_table,
                 window_size_left,
                 window_size_right,
+                num_sink_tokens,
                 learnable_sink,
             ]
             if arch // 10 in [10, 11]:
@@ -1259,6 +1264,7 @@ def _flash_attn_bwd(
     softcap: float = 0.0,
     window_size_left: Optional[int] = None,
     window_size_right: Optional[int] = None,
+    num_sink_tokens: Optional[int] = None,
     m_block_size: int = 64,
     n_block_size: int = 128,
     num_threads: int = 256,
@@ -1971,6 +1977,7 @@ class FlashAttnFunc(torch.autograd.Function):
         softmax_scale: Optional[float] = None,
         causal: bool = False,
         window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+        num_sink_tokens: Optional[int] = None,
         learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
         num_splits: int = 1,
@@ -2002,6 +2009,7 @@ class FlashAttnFunc(torch.autograd.Function):
             causal=causal,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
+            num_sink_tokens=num_sink_tokens,
             learnable_sink=learnable_sink,
             softcap=softcap,
             num_splits=num_splits,
@@ -2018,6 +2026,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
+        ctx.num_sink_tokens = num_sink_tokens
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.return_lse = return_lse
@@ -2049,6 +2058,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.softcap,
             window_size_left=ctx.window_size[0],
             window_size_right=ctx.window_size[1],
+            num_sink_tokens=ctx.num_sink_tokens,
             deterministic=ctx.deterministic,
             score_mod=ctx.score_mod,
             score_mod_bwd=ctx.score_mod_bwd,
@@ -2081,6 +2091,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         softmax_scale: Optional[float] = None,
         causal: bool = False,
         window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+        num_sink_tokens: Optional[int] = None,
         learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
         num_splits: int = 1,
@@ -2119,6 +2130,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             causal=causal,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
+            num_sink_tokens=num_sink_tokens,
             learnable_sink=learnable_sink,
             softcap=softcap,
             num_splits=num_splits,
@@ -2146,6 +2158,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
+        ctx.num_sink_tokens = num_sink_tokens
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.max_seqlen_q = max_seqlen_q
@@ -2178,6 +2191,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.softcap,
             window_size_left=ctx.window_size[0],
             window_size_right=ctx.window_size[1],
+            num_sink_tokens=ctx.num_sink_tokens,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             seqused_q=seqused_q,
@@ -2205,6 +2219,7 @@ def flash_attn_func(
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    num_sink_tokens: Optional[int] = None,
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
     num_splits: int = 1,
@@ -2228,6 +2243,7 @@ def flash_attn_func(
         softmax_scale,
         causal,
         window_size,
+        num_sink_tokens,
         learnable_sink,
         softcap,
         num_splits,
@@ -2261,6 +2277,7 @@ def flash_attn_varlen_func(
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    num_sink_tokens: Optional[int] = None,
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
     num_splits: int = 1,
@@ -2322,6 +2339,7 @@ def flash_attn_varlen_func(
         softmax_scale,
         causal,
         window_size,
+        num_sink_tokens,
         learnable_sink,
         softcap,
         num_splits,

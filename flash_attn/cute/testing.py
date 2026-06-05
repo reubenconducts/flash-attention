@@ -279,6 +279,7 @@ def construct_local_mask(
         return col_idx > row_idx + sk - sq + window_size[1]
     else:
         sk = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
+        effective_left = window_size[0] - sink_token_length
         if window_size[1] is None:
             local_mask_left = col_idx > sk
         else:
@@ -286,7 +287,7 @@ def construct_local_mask(
         return torch.logical_or(
             local_mask_left,
             torch.logical_and(
-                col_idx < row_idx + sk - sq - window_size[0], col_idx >= sink_token_length
+                col_idx < row_idx + sk - sq - effective_left, col_idx >= sink_token_length
             ),
         )
 

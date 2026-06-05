@@ -1395,14 +1395,14 @@ class FlashAttentionBackwardSm100:
         tdQtdQ = cute.make_tensor(tmem_ptr + self.tmem_dQ_offset, tdQtdQ.layout)
 
         block_info = BlockInfo(
-            self.tile_m,
+            tile_m=self.tile_m,
             # self.tile_n,
-            self.tile_n * self.cluster_shape_mnk[0],  # careful, this case is not very well-tested
-            self.is_causal,
-            self.is_local,
-            False,  # is_split_kv
-            window_size_left,
-            window_size_right,
+            tile_n=self.tile_n * self.cluster_shape_mnk[0],  # careful, this case is not very well-tested
+            is_causal=self.is_causal,
+            is_local=self.is_local,
+            is_split_kv=False,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
             qhead_per_kvhead_packgqa=1,
         )
         SeqlenInfoCls = partial(

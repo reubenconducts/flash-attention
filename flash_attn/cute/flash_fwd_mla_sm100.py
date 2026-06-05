@@ -958,8 +958,8 @@ class FlashAttentionMLAForwardSm100:
         tOtO1_fake = thr_mma_PVt.make_fragment_C(acc_shape_Oi)
 
         block_info = BlockInfo(
-            self.cta_tile_m * self.cta_group_size,
-            self.tile_n,
+            tile_m=self.cta_tile_m * self.cta_group_size,
+            tile_n=self.tile_n,
             is_causal=self.is_causal,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )

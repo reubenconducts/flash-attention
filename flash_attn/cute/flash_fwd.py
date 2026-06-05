@@ -783,13 +783,13 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         m_block, num_head, batch_size, _ = work_tile.tile_idx
 
         block_info = BlockInfo(
-            self.tile_m,
-            self.tile_n,
-            self.is_causal,
-            self.is_local,
-            False,  # is_split_kv
-            window_size_left,
-            window_size_right,
+            tile_m=self.tile_m,
+            tile_n=self.tile_n,
+            is_causal=self.is_causal,
+            is_local=self.is_local,
+            is_split_kv=False,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
         seqlen = SeqlenInfoQK.create(

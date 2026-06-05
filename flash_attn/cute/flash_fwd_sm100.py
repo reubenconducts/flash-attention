@@ -121,6 +121,7 @@ class FlashAttentionForwardSm100:
         qhead_per_kvhead: cutlass.Constexpr[int] = 1,
         is_causal: bool = False,
         is_local: bool = False,
+        has_sink_tokens: bool = False,
         is_split_kv: bool = False,
         pack_gqa: bool = False,
         q_subtile_factor: int | None = None,
@@ -176,9 +177,12 @@ class FlashAttentionForwardSm100:
         self.is_persistent = is_persistent
         self.is_causal = is_causal
         self.is_local = is_local
+        self.has_sink_tokens = has_sink_tokens
+        assert not self.has_sink_tokens or self.is_local, "sink tokens are only supported for local attention"
         self.is_varlen_q = is_varlen_q
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
+        assert not (self.is_split_kv and self.has_sink_tokens), "sink tokens are not supported for split KV"
         self.pack_gqa = pack_gqa
         self.use_tma_O = (
             not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
@@ -383,6 +387,7 @@ class FlashAttentionForwardSm100:
         mPageTable: Optional[cute.Tensor] = None,  # (b_k, max_num_pages_per_seq)
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
+        num_sink_tokens: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
@@ -753,6 +758,7 @@ class FlashAttentionForwardSm100:
             softmax_scale,
             window_size_left,
             window_size_right,
+            num_sink_tokens,
             learnable_sink,
             descale_tensors,
             blocksparse_tensors,
@@ -778,13 +784,14 @@ class FlashAttentionForwardSm100:
             min_blocks_per_mp=1,
         )
 
-    def _generate_attention_mask_cls(self, window_size_left, window_size_right):
+    def _generate_attention_mask_cls(self, window_size_left, window_size_right, num_sink_tokens):
         return partial(
             AttentionMask,
             self.m_block_size,
             self.n_block_size,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
+            num_sink_tokens=num_sink_tokens,
             qhead_per_kvhead_packgqa=(
                 self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
             ),
@@ -812,6 +819,7 @@ class FlashAttentionForwardSm100:
         softmax_scale: Float32 | None,
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
+        num_sink_tokens: Optional[Int32],
         learnable_sink: Optional[cute.Tensor],
         descale_tensors: Optional[DescaleTensors],
         blocksparse_tensors: Optional[BlockSparseTensors],
@@ -1052,13 +1060,15 @@ class FlashAttentionForwardSm100:
 
         block_info = BlockInfo(
             # This is cta_tiler, not mma_tiler_qk, since we move by block by (2 * mma_tiler[0], mma_tiler[1])
-            self.cta_tiler[0],
-            self.cta_tiler[1],
-            self.is_causal,
-            self.is_local,
-            self.is_split_kv,
-            window_size_left,
-            window_size_right,
+            tile_m=self.cta_tiler[0],
+            tile_n=self.cta_tiler[1],
+            is_causal=self.is_causal,
+            is_local=self.is_local,
+            has_sink_tokens=self.has_sink_tokens,
+            is_split_kv=self.is_split_kv,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            num_sink_tokens=num_sink_tokens,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
         SeqlenInfoCls = partial(
@@ -1079,7 +1089,7 @@ class FlashAttentionForwardSm100:
             ),
         )
         AttentionMaskCls = self._generate_attention_mask_cls(
-            window_size_left, window_size_right
+            window_size_left, window_size_right, num_sink_tokens
         )
         # Cluster wait before tensor memory alloc
         pipeline_init_wait(cluster_shape_mn=cta_layout_vmnk)
@@ -1468,7 +1478,31 @@ class FlashAttentionForwardSm100:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen, m_block, split_idx, num_splits
                 )
-                if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
+                if const_expr(self.has_sink_tokens):
+                    # Sink tokens are always processed as logical block 0 before the regular
+                    # local-window mainloop. Keep block 0 out of the regular loop.
+                    n_block_zero = Int32(0)
+                    page_idx = (
+                        mPageTable[batch_idx, n_block_zero]
+                        if const_expr(mPageTable is not None and self.use_tma_KV)
+                        else None
+                    )
+                    if const_expr(not self.use_tma_KV):
+                        paged_kv_manager.load_page_table(n_block_zero)
+                    if issue_kv_for_this_warp:
+                        load_K(block=n_block_zero, producer_state=kv_producer_state, page_idx=page_idx)  # K_sink
+                    if issue_q_for_this_warp:
+                        load_Q(block=n_block_zero, stage=0)
+                    if issue_kv_for_this_warp:
+                        kv_producer_state.advance()
+                    if const_expr(self.q_stage == 2) and issue_q_for_this_warp:
+                        load_Q(block=Int32(1), stage=1)
+                    q_producer_phase ^= 1
+                    if issue_kv_for_this_warp:
+                        load_V(block=n_block_zero, producer_state=kv_producer_state, page_idx=page_idx)  # V_sink
+                        kv_producer_state.advance()
+
+                if (const_expr(not self.has_sink_tokens and not self.is_split_kv) or n_block_min < n_block_max):
                     n_block_first = n_block_max - 1 if n_block_max > 0 else 0
                     page_idx = (
                         mPageTable[batch_idx, n_block_first]
@@ -1480,13 +1514,14 @@ class FlashAttentionForwardSm100:
                     if issue_kv_for_this_warp:
                         load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0
                     # load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx, extra_tx_count=self.tma_copy_bytes["Q"])  # K0
-                    if issue_q_for_this_warp:
+                    if const_expr(not self.has_sink_tokens) and issue_q_for_this_warp:
                         load_Q(block=0, stage=0)
                     if issue_kv_for_this_warp:
                         kv_producer_state.advance()
-                    if const_expr(self.q_stage == 2) and issue_q_for_this_warp:
+                    if const_expr(not self.has_sink_tokens and self.q_stage == 2) and issue_q_for_this_warp:
                         load_Q(block=1, stage=1)
-                    q_producer_phase ^= 1
+                    if const_expr(not self.has_sink_tokens):
+                        q_producer_phase ^= 1
                     if issue_kv_for_this_warp:
                         load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0
                         kv_producer_state.advance()
@@ -1671,7 +1706,7 @@ class FlashAttentionForwardSm100:
                 process_tile = block_iter_count > Int32(0)
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
-                block_iter_count = n_block_max - n_block_min
+                block_iter_count = block_info.get_n_block_count(n_block_min, n_block_max)
                 if const_expr(not self.is_split_kv):
                     process_tile = True
                 else:
@@ -2041,7 +2076,7 @@ class FlashAttentionForwardSm100:
                 )
                 has_work = tile_block_count > Int32(0)
             else:
-                tile_block_count = n_block_max - n_block_min
+                tile_block_count = block_info.get_n_block_count(n_block_min, n_block_max)
                 has_work = const_expr(not self.is_split_kv) or tile_block_count > Int32(0)
 
             softmax_step = partial(
@@ -2124,15 +2159,25 @@ class FlashAttentionForwardSm100:
                     # if tidx == 0: cute.printf("softmax row sum stage %d: %f\n", stage, softmax.row_sum[0])
             else:
                 if const_expr(not self.is_split_kv) or tile_block_count > Int32(0):
-                    mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase = softmax_step(
-                        mma_si_consumer_phase,
-                        sm_stats_producer_phase,
-                        s0_s1_sequence_phase,
-                        n_block_max - 1,
-                        is_first=True,
-                        mask_fn=partial(mask_fn, mask_seqlen=True),
-                    )
-                    n_block_max -= 1
+                    if const_expr(self.has_sink_tokens):
+                        mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase = softmax_step(
+                            mma_si_consumer_phase,
+                            sm_stats_producer_phase,
+                            s0_s1_sequence_phase,
+                            0,
+                            is_first=True,
+                            mask_fn=partial(mask_fn, mask_sink=True, mask_seqlen=True),
+                        )
+                    if const_expr(not self.has_sink_tokens) or n_block_min < n_block_max:
+                        mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase = softmax_step(
+                            mma_si_consumer_phase,
+                            sm_stats_producer_phase,
+                            s0_s1_sequence_phase,
+                            n_block_max - 1,
+                            is_first=const_expr(not self.has_sink_tokens),
+                            mask_fn=partial(mask_fn, mask_seqlen=True),
+                        )
+                        n_block_max -= 1
                     # Next couple of iterations with causal masking
                     if const_expr(self.is_causal or self.is_local):
                         n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
@@ -2459,7 +2504,7 @@ class FlashAttentionForwardSm100:
                 )
                 has_work = total_block_count > Int32(0)
             else:
-                total_block_count = n_block_max - n_block_min
+                total_block_count = block_info.get_n_block_count(n_block_min, n_block_max)
                 has_work = const_expr(not self.is_split_kv) or total_block_count > Int32(0)
 
             if has_work:
@@ -3068,6 +3113,9 @@ class FlashAttentionForwardSm100:
         else:
             return sX
 
+    @cute.jit
+    def load_KV_sink_tokens(self, tXgX: Optional[cute.Tensor], tXsX: Optional[cute.Tensor]):
+        pass
     # @cute.jit
     # def warp_scheduler_barrier_init(self):
     #     warp_group_idx = utils.canonical_warp_group_idx(sync=False)

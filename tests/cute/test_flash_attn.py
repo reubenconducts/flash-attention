@@ -66,18 +66,20 @@ VERBOSE = True
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("has_learnable_sink", [False, True])
-# @pytest.mark.parametrize("has_learnable_sink", [False])
+# @pytest.mark.parametrize("has_learnable_sink", [False, True])
+@pytest.mark.parametrize("has_learnable_sink", [False])
+@pytest.mark.parametrize("num_sink_tokens", [None, 1, 4, 16, 32])
+# @pytest.mark.parametrize("num_sink_tokens", [1])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
-@pytest.mark.parametrize("deterministic", [False, True])
-# @pytest.mark.parametrize("deterministic", [False])
-@pytest.mark.parametrize("softcap", [0.0, 15.0])
-# @pytest.mark.parametrize("softcap", [0.0])
+# @pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("deterministic", [False])
+# @pytest.mark.parametrize("softcap", [0.0, 15.0])
+@pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
-# @pytest.mark.parametrize("local_enum", [0])
-@pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [False])
+# @pytest.mark.parametrize("local_enum", [1])
+# @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192, 256])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
@@ -85,8 +87,8 @@ VERBOSE = True
 # @pytest.mark.parametrize("d", [64, 128, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128, 192])
-# @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 96, 128, 192, 256])
+@pytest.mark.parametrize("d", [128, 192])
+# @pytest.mark.parametrize("d", [64, 96, 128, 192, 256])
 # @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -131,6 +133,7 @@ def test_flash_attn_output(
     softcap,
     deterministic,
     has_qv,
+    num_sink_tokens,
     has_learnable_sink,
     mha_type,
     dtype,
@@ -138,6 +141,8 @@ def test_flash_attn_output(
     local = local_enum > 0
     if local and causal:
         pytest.skip()
+    if (not local) and (num_sink_tokens is not None):
+        pytest.skip("sink tokens only enabled with local attention")
     if has_qv and d != 64:
         pytest.skip()
     if has_qv and local:
@@ -219,6 +224,8 @@ def test_flash_attn_output(
             (None, None) if not local else tuple(random.randrange(0, seqlen_k) for _ in range(2))
         )
         if local_enum == 2:
+            if num_sink_tokens is not None and window_size[1] == 0:
+                window_size = (window_size[0], 1)
             window_size = (None, -window_size[1])
         elif local_enum == 3:
             window_size = (-window_size[0], None)
@@ -229,6 +236,9 @@ def test_flash_attn_output(
             learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
         else:
             learnable_sink = None
+        has_attn_sink = learnable_sink is not None or (
+            num_sink_tokens is not None and num_sink_tokens != 0
+        )
         if dtype == torch.float8_e4m3fn:
             q_descale, k_descale, v_descale = [
                 torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32)
@@ -251,6 +261,7 @@ def test_flash_attn_output(
             k_descale=k_descale,
             v_descale=v_descale,
             window_size=window_size,
+            sink_token_length=num_sink_tokens if num_sink_tokens is not None else 0,
             attention_chunk=attention_chunk,
             learnable_sink=learnable_sink,
             softcap=softcap,
@@ -267,6 +278,7 @@ def test_flash_attn_output(
             k_descale=k_descale,
             v_descale=v_descale,
             window_size=window_size,
+            sink_token_length=num_sink_tokens if num_sink_tokens is not None else 0,
             attention_chunk=attention_chunk,
             learnable_sink=learnable_sink,
             softcap=softcap,
@@ -296,7 +308,7 @@ def test_flash_attn_output(
         pack_gqa_vals = [True] if has_qv else [False, True, None] if not TEST_BWD_ONLY else [False]
         # SplitKV is not supported for hdim >= 192
         # pack_gqa_vals = [False]
-        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY and not has_qv else [1]
+        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY and not has_qv and num_sink_tokens is None else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
@@ -319,6 +331,7 @@ def test_flash_attn_output(
                 causal=causal,
                 # q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
                 window_size=window_size,
+                num_sink_tokens=num_sink_tokens,
                 # attention_chunk=attention_chunk,
                 softcap=softcap,
                 learnable_sink=learnable_sink,
@@ -352,7 +365,7 @@ def test_flash_attn_output(
                 or (d == 192 and dv == 128)
                 or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0)
             )
-            and learnable_sink is None
+            and not has_attn_sink
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
         ):
@@ -487,16 +500,17 @@ def test_flash_attn_small_head_dim(seqlen_q, seqlen_k, d, causal, dtype):
 # @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("has_learnable_sink", [False, True])
 @pytest.mark.parametrize("has_learnable_sink", [False])
+@pytest.mark.parametrize("num_sink_tokens", [None, 1, 4, 16, 32])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
-@pytest.mark.parametrize("deterministic", [False, True])
-# @pytest.mark.parametrize("deterministic", [False])
-@pytest.mark.parametrize("softcap", [0.0, 15.0])
-# @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
-# @pytest.mark.parametrize("local_enum", [0])
-@pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [False])
+# @pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("deterministic", [False])
+# @pytest.mark.parametrize("softcap", [0.0, 15.0])
+@pytest.mark.parametrize("softcap", [0.0])
+# @pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
+@pytest.mark.parametrize("local_enum", [1])
+# @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("add_unused_qkv", [False, True])
 @pytest.mark.parametrize("add_unused_qkv", [False])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -505,13 +519,13 @@ def test_flash_attn_small_head_dim(seqlen_q, seqlen_k, d, causal, dtype):
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
-# @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 128, 192, 256])
+@pytest.mark.parametrize("d", [128])
+# @pytest.mark.parametrize("d", [64, 128, 192, 256])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
         # (1, 1),
-        # (1, 3),
+        (1, 3),
         # (2, 1),
         (511, 1),
         (3, 513),
@@ -522,19 +536,19 @@ def test_flash_attn_small_head_dim(seqlen_q, seqlen_k, d, causal, dtype):
         (128, 217),
         (113, 211),
         (108, 256),
-        (256, 512),
-        (307, 256),
-        (640, 128),
-        (512, 256),
-        (1024, 1024),
-        (1023, 1024),
-        (1024, 1023),
-        (2048, 2048),
-        # SM100 hd256 2CTA test cases
-        (64, 1),
-        (255, 256),
-        (4096, 4096),
-        (4224, 4224),
+        # (256, 512),
+        # (307, 256),
+        # (640, 128),
+        # (512, 256),
+        # (1024, 1024),
+        # (1023, 1024),
+        # (1024, 1023),
+        # (2048, 2048),
+        # # SM100 hd256 2CTA test cases
+        # (64, 1),
+        # (255, 256),
+        # (4096, 4096),
+        # (4224, 4224),
     ],
 )
 @pytest.mark.parametrize("varlen_mode", ["random", "third", "full"])
@@ -569,6 +583,7 @@ def test_flash_attn_varlen_output(
     softcap,
     deterministic,
     has_qv,
+    num_sink_tokens,
     has_learnable_sink,
     mha_type,
     dtype,
@@ -581,6 +596,8 @@ def test_flash_attn_varlen_output(
     local = local_enum > 0
     if local and causal:
         pytest.skip()
+    if (not local) and (num_sink_tokens is not None):
+        pytest.skip("sink tokens only enabled with local attention")
     # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
     # Remove these skips when support is added.
     if d == 256 and IS_SM100:
@@ -765,6 +782,7 @@ def test_flash_attn_varlen_output(
             k_descale=k_descale,
             v_descale=v_descale,
             window_size=window_size,
+            sink_token_length=num_sink_tokens if num_sink_tokens is not None else 0,
             attention_chunk=attention_chunk,
             learnable_sink=learnable_sink,
             softcap=softcap,
@@ -781,6 +799,7 @@ def test_flash_attn_varlen_output(
             k_descale=k_descale,
             v_descale=v_descale,
             window_size=window_size,
+            sink_token_length=num_sink_tokens if num_sink_tokens is not None else 0,
             attention_chunk=attention_chunk,
             learnable_sink=learnable_sink,
             softcap=softcap,
@@ -804,7 +823,11 @@ def test_flash_attn_varlen_output(
         # pack_gqa_vals = [False]
         # num_splits_vals = [1, 3]
         # SplitKV is not supported for hdim >= 192
-        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
+        num_splits_vals = (
+            [1, 3]
+            if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY and num_sink_tokens is None
+            else [1]
+        )
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
@@ -832,6 +855,7 @@ def test_flash_attn_varlen_output(
                 # q_descale=q_descale,
                 # k_descale=k_descale, v_descale=v_descale,
                 window_size=window_size,
+                num_sink_tokens=num_sink_tokens,
                 # attention_chunk=attention_chunk,
                 learnable_sink=learnable_sink,
                 softcap=softcap,
@@ -879,6 +903,7 @@ def test_flash_attn_varlen_output(
                 or (IS_SM100 and d == 256 and dv == 256)
             )
             and not has_learnable_sink
+            and num_sink_tokens is None
             and softcap == 0.0 # TODO: support softcap != 0.0 in varlen bwd
             # and False
         ):

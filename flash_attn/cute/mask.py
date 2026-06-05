@@ -162,6 +162,7 @@ class AttentionMask:
     seqlen_info: SeqlenInfoQK
     window_size_left: Optional[Int32] = None
     window_size_right: Optional[Int32] = None
+    num_sink_tokens: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1  # only pass in if we're doing PackGQA
     swap_AB: cutlass.Constexpr[bool] = False
 
@@ -184,6 +185,7 @@ class AttentionMask:
         thr_mma: cute.TiledMma,
         mask_seqlen: cutlass.Constexpr[bool],
         mask_causal: cutlass.Constexpr[bool],
+        mask_sink: cutlass.Constexpr[bool] = False,
         mask_local: cutlass.Constexpr[bool] = False,
         mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
         aux_data: AuxData = AuxData(),
@@ -622,6 +624,7 @@ class AttentionMask:
         mask_seqlen: cutlass.Constexpr[bool],
         mask_causal: cutlass.Constexpr[bool],
         mask_local: cutlass.Constexpr[bool] = False,
+        mask_sink: cutlass.Constexpr[bool] = False,
         mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
         batch_idx: Int32 = None,
         head_idx: Int32 = None,
@@ -634,6 +637,7 @@ class AttentionMask:
         rBitmask: Optional[cute.Tensor] = None,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
+        assert not mask_sink or mask_local, "local masking must be active for mask_sink"
         acc_shape = (self.tile_m, self.tile_n)
         cS = cute.make_identity_tensor(acc_shape if not self.swap_AB else acc_shape[::-1])
         tScS = thr_mma.partition_C(cS)
@@ -739,6 +743,11 @@ class AttentionMask:
                 )
                 local_row_offset_left = (
                     causal_row_offset - self.window_size_left
+                    + (
+                        self.num_sink_tokens
+                        if const_expr(self.num_sink_tokens is not None)
+                        else 0
+                    )
                     if const_expr(self.window_size_left is not None)
                     else None
                 )
@@ -757,20 +766,32 @@ class AttentionMask:
                     # if cute.arch.thread_idx()[0] == 0 or cute.arch.thread_idx()[0] == 128: cute.printf("m_block = {}, n_block = {}, row_idx = {}, causal_row_offset = {}, col_limit_right = {}, col_limit_left = {}", m_block, n_block, row_idx, causal_row_offset, col_limit_right, col_limit_left)
                     for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
                         col_idx = tScS_t2r[i][1]
-                        acc_S[i] = (
-                            -Float32.inf
-                            if col_idx >= col_limit_right or col_idx < col_limit_left
-                            else acc_S[i]
-                        )
+                        if const_expr(self.num_sink_tokens is not None and mask_sink):
+                            global_col_idx = n_block * self.tile_n + col_idx
+                            sink_token_limit = cutlass.min(self.num_sink_tokens, self.seqlen_k)
+                            is_sink_col = global_col_idx < sink_token_limit
+                            cond = col_idx >= col_limit_right or (col_idx < col_limit_left and not is_sink_col)
+                        else:
+                            cond = col_idx >= col_limit_right or col_idx < col_limit_left
+                        acc_S[i] = -Float32.inf if cond else acc_S[i]
                 else:
                     # Dual-bound R2P masking for SM100.
                     # Masks elements where: NOT (col_limit_left <= col < col_limit_right)
+                    # Sink tokens bypass the left bound but still obey the right bound.
 
-                    def mask_gen_fn(s: int) -> Uint32:
-                        return r2p_bitmask_below(col_limit_right, s) & r2p_bitmask_above(
-                            col_limit_left, s
+                    if const_expr(not mask_sink):
+                        mask_gen_fn = lambda s: (
+                            r2p_bitmask_below(col_limit_right, s)
+                            & r2p_bitmask_above(col_limit_left, s)
                         )
-
+                    else:
+                        sink_limit = cutlass.max(self.num_sink_tokens - n_block * self.tile_n, Int32(0))
+                        sink_limit = cutlass.min(sink_limit, seqlenk_col_limit)
+                        mask_gen_fn = lambda s: (
+                            r2p_bitmask_below(col_limit_right, s)
+                            & (r2p_bitmask_above(col_limit_left, s)
+                            | r2p_bitmask_below(sink_limit, s))
+                        )
                     mask_r2p_lambda(acc_S, mask_gen_fn, rank1=True)
 
     @cute.jit
@@ -784,6 +805,7 @@ class AttentionMask:
         mask_seqlen: cutlass.Constexpr,
         mask_causal: cutlass.Constexpr,
         mask_local: cutlass.Constexpr,
+        mask_sink: cutlass.Constexpr[bool] = False,
         mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
         batch_idx: Int32 = None,
         head_idx: Int32 = None,

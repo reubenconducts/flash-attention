@@ -587,7 +587,9 @@ def cute_prefix_lm_mask_vec(
     prefix = cutlass.Int32(512)
     hi_pref = prefix - n_idx[0]
     m_below_pref = max(cutlass.Int32(32) - hi_pref, cutlass.Int32(0))
-    term1_below = utils.shr_u32(cutlass.Uint32(0xFFFFFFFF), cutlass.Uint32(m_below_pref))
+    term1_below = utils.shr_u32(
+        cutlass.Uint32(0xFFFFFFFF), cutlass.Uint32(m_below_pref)
+    )
     row_in_prefix_mask = (
         cutlass.Uint32(0xFFFFFFFF) if m_idx[0] < prefix else cutlass.Uint32(0)
     )
@@ -598,6 +600,36 @@ def cute_prefix_lm_mask_vec(
     result = cute.make_rmem_tensor(1, dtype=cutlass.Uint32)
     result[0] = term1 | term2
     return result.load()
+
+
+def get_attention_sink_mask_vec(
+    window_left: int, window_right: int, num_sinks: int = 0
+) -> Callable:
+
+    window_left -= num_sinks
+    @cute.jit
+    def _cute_attention_sink_mask_vec(
+        batch: cute.TensorSSA,
+        head: cute.TensorSSA,
+        m_idx: cute.TensorSSA,
+        n_idx: cute.TensorSSA,
+        seqlen_info,
+        aux_tensors,
+    ) -> cute.TensorSSA:
+        runtime_offset = seqlen_info.seqlen_k - seqlen_info.seqlen_q
+        center = m_idx[0] + runtime_offset
+        lo = center - cutlass.Int32(window_left) - n_idx[0]
+        hi_excl = center + cutlass.Int32(window_right) - n_idx[0] + cutlass.Int32(1)
+        m_below = max(cutlass.Int32(32) - hi_excl, cutlass.Int32(0))
+        below = utils.shr_u32(cutlass.Uint32(0xFFFFFFFF), cutlass.Uint32(m_below))
+        n_above = max(lo, cutlass.Int32(0))
+        above = utils.shl_u32(cutlass.Uint32(0xFFFFFFFF), cutlass.Uint32(n_above))
+        in_sink = utils.shr_u32(cutlass.Uint32(0xFFFFFFFF), cutlass.Uint32(num_sinks))
+        result = cute.make_rmem_tensor(1, dtype=cutlass.Uint32)
+        result[0] = (below & above) | in_sink
+        return result.load()
+
+    return _cute_attention_sink_mask_vec
 
 
 # =============================================================================
