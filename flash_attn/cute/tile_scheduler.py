@@ -163,6 +163,7 @@ class TileSchedulerArguments(ParamsBase):
     lpt: cutlass.Constexpr[bool] = False
     is_split_kv: cutlass.Constexpr[bool] = False
     head_swizzle: cutlass.Constexpr[bool] = False
+    has_sink_tokens: cutlass.Constexpr[bool] = False
     use_cluster_idx: cutlass.Constexpr[bool] = False
 
 
@@ -647,6 +648,7 @@ class SingleTileLPTBwdScheduler:
         num_hb_quotient: Int32
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
         spt: cutlass.Constexpr[bool] = True
+        has_sink_tokens: cutlass.Constexpr[bool] = False
 
         @staticmethod
         @cute.jit
@@ -681,6 +683,7 @@ class SingleTileLPTBwdScheduler:
                 num_hb_quotient=Int32(num_hb_quotient),
                 cluster_shape_mn=args.cluster_shape_mn,
                 spt=args.lpt,
+                has_sink_tokens=args.has_sink_tokens,
             )
 
     def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None):
@@ -734,7 +737,11 @@ class SingleTileLPTBwdScheduler:
         bidhb_actual = bidhb * params.l2_minor + bidhb_residual
         batch_idx, head_idx = divmod(bidhb_actual, params.num_head_divmod)
         if cutlass.const_expr(params.spt):
-            block = params.num_block - 1 - block
+            if cutlass.const_expr(params.has_sink_tokens):
+                if block != 0:
+                    block = params.num_block - block 
+            else:
+                block = params.num_block - 1 - block
         if cutlass.const_expr(params.cluster_shape_mn[0] > 1):
             bidx_in_cluster = cute.arch.block_in_cluster_idx()
             block = block * params.cluster_shape_mn[0] + bidx_in_cluster[0]
@@ -781,6 +788,7 @@ class SingleTileVarlenScheduler:
         mSeqUsedQ: Optional[cute.Tensor] = None
         qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
         lpt: cutlass.Constexpr[bool] = False
+        has_sink_tokens: cutlass.Constexpr[bool] = False
         is_split_kv: cutlass.Constexpr[bool] = False
         head_swizzle: cutlass.Constexpr[bool] = False
         cluster_shape_m: cutlass.Constexpr[int] = 1
@@ -827,6 +835,7 @@ class SingleTileVarlenScheduler:
                 mSeqUsedQ=args.mSeqUsedQ,
                 qhead_per_kvhead_packgqa=args.qhead_per_kvhead_packgqa,
                 lpt=args.lpt,
+                has_sink_tokens=args.has_sink_tokens,
                 is_split_kv=args.is_split_kv,
                 head_swizzle=args.head_swizzle,
                 cluster_shape_m=args.cluster_shape_mn[0],
@@ -1019,7 +1028,11 @@ class SingleTileVarlenScheduler:
                 head_idx_residual = l2_mod - block * nheads_in_this_section
                 head_idx = section_idx * nheads_in_l2 + head_idx_residual
                 if cutlass.const_expr(params.lpt):
-                    block = num_m_blocks - 1 - block
+                    if cutlass.const_expr(params.has_sink_tokens):
+                        if block != 0:
+                            block = num_m_blocks - block 
+                    else:
+                        block = num_m_blocks - 1 - block
             else:
                 head_idx = mh_block // num_m_blocks
                 block = mh_block - head_idx * num_m_blocks

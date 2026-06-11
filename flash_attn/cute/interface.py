@@ -418,6 +418,7 @@ def _flash_attn_fwd(
             assert t.stride(0) == 1, (
                 "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be contiguous"
             )
+    has_sink_tokens = num_sink_tokens is not None and num_sink_tokens > 0
     if learnable_sink is not None:
         assert learnable_sink.shape == (num_head,)
         assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
@@ -724,7 +725,7 @@ def _flash_attn_fwd(
         page_table is not None,
         window_size_left is not None,
         window_size_right is not None,
-        num_sink_tokens is not None,
+        has_sink_tokens,
         learnable_sink is not None,
         q_descale is not None,
         k_descale is not None,
@@ -925,7 +926,7 @@ def _flash_attn_fwd(
                     qhead_per_kvhead=qhead_per_kvhead,
                     is_causal=causal,
                     is_local=local,
-                    has_sink_tokens=num_sink_tokens is not None and num_sink_tokens!=0,
+                    has_sink_tokens=has_sink_tokens,
                     is_split_kv=is_split_kv,
                     pack_gqa=pack_gqa,
                     m_block_size=tile_m,
@@ -1379,6 +1380,8 @@ def _flash_attn_bwd(
         cluster_size = 2 if head_dim >= 128 and not disable_2cta else 1
         use_2cta_instrs = cluster_size==2
 
+    has_sink_tokens = num_sink_tokens is not None and num_sink_tokens > 0
+
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
 
@@ -1701,6 +1704,7 @@ def _flash_attn_bwd(
             causal,
             window_size_left is not None,
             window_size_right is not None,
+            has_sink_tokens,
             m_block_size,
             n_block_size,
             num_threads,
@@ -1839,6 +1843,7 @@ def _flash_attn_bwd(
                     head_dim_v,
                     is_causal=causal,
                     is_local=local,
+                    has_sink_tokens=has_sink_tokens,
                     qhead_per_kvhead=qhead_per_kvhead,
                     tile_m=m_block_size,
                     tile_n=n_block_size,
@@ -1878,6 +1883,7 @@ def _flash_attn_bwd(
             seqused_k_tensor,
             window_size_left,
             window_size_right,
+            num_sink_tokens,
             dQ_semaphore_tensor,
             dK_semaphore_tensor,
             dV_semaphore_tensor,
@@ -1905,6 +1911,7 @@ def _flash_attn_bwd(
             seqused_k,
             window_size_left,
             window_size_right,
+            num_sink_tokens,
             dQ_semaphore,
             dK_semaphore,
             dV_semaphore,

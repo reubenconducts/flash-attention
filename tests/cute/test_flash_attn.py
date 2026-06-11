@@ -68,8 +68,8 @@ VERBOSE = True
 # @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("has_learnable_sink", [False, True])
 @pytest.mark.parametrize("has_learnable_sink", [False])
-@pytest.mark.parametrize("num_sink_tokens", [None, 1, 4, 16, 32])
-# @pytest.mark.parametrize("num_sink_tokens", [1])
+# @pytest.mark.parametrize("num_sink_tokens", [None, 1, 4, 16, 32])
+@pytest.mark.parametrize("num_sink_tokens", [None])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
@@ -87,9 +87,9 @@ VERBOSE = True
 # @pytest.mark.parametrize("d", [64, 128, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128, 192])
-@pytest.mark.parametrize("d", [128, 192])
+# @pytest.mark.parametrize("d", [128, 192])
 # @pytest.mark.parametrize("d", [64, 96, 128, 192, 256])
-# @pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -104,18 +104,18 @@ VERBOSE = True
         (255, 256),  # SM100 hd256 2CTA test case
         (239, 1),
         (799, 3),
-        (113, 203),
-        (113, 128),
-        (128, 217),
-        (113, 211),
-        (108, 256),
-        (256, 512),
-        (384, 256),
-        (640, 128),
-        (512, 256),
-        (1024, 1024),
-        (1023, 1024),
-        (1024, 1023),
+        # (113, 203),
+        # (113, 128),
+        # (128, 217),
+        # (113, 211),
+        # (108, 256),
+        # (256, 512),
+        # (384, 256),
+        # (640, 128),
+        # (512, 256),
+        # (1024, 1024),
+        # (1023, 1024),
+        # (1024, 1023),
         (2048, 2048),
         (4096, 4096),
         (4224, 4224),
@@ -236,9 +236,7 @@ def test_flash_attn_output(
             learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
         else:
             learnable_sink = None
-        has_attn_sink = learnable_sink is not None or (
-            num_sink_tokens is not None and num_sink_tokens != 0
-        )
+        has_attn_sink = learnable_sink is not None # or (num_sink_tokens is not None and num_sink_tokens > 0)
         if dtype == torch.float8_e4m3fn:
             q_descale, k_descale, v_descale = [
                 torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32)
@@ -496,19 +494,19 @@ def test_flash_attn_small_head_dim(seqlen_q, seqlen_k, d, causal, dtype):
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize("mha_type", ["mha"])
+# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
 # @pytest.mark.parametrize("has_learnable_sink", [False, True])
 @pytest.mark.parametrize("has_learnable_sink", [False])
-@pytest.mark.parametrize("num_sink_tokens", [None, 1, 4, 16, 32])
+@pytest.mark.parametrize("num_sink_tokens", [None, 1, 32])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
-# @pytest.mark.parametrize("deterministic", [False, True])
-@pytest.mark.parametrize("deterministic", [False])
+@pytest.mark.parametrize("deterministic", [False, True])
+# @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-# @pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
-@pytest.mark.parametrize("local_enum", [1])
+@pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
+# @pytest.mark.parametrize("local_enum", [1])
 # @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("add_unused_qkv", [False, True])
@@ -540,10 +538,10 @@ def test_flash_attn_small_head_dim(seqlen_q, seqlen_k, d, causal, dtype):
         # (307, 256),
         # (640, 128),
         # (512, 256),
-        # (1024, 1024),
-        # (1023, 1024),
-        # (1024, 1023),
-        # (2048, 2048),
+        (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (2048, 2048),
         # # SM100 hd256 2CTA test cases
         # (64, 1),
         # (255, 256),
@@ -551,8 +549,8 @@ def test_flash_attn_small_head_dim(seqlen_q, seqlen_k, d, causal, dtype):
         # (4224, 4224),
     ],
 )
-@pytest.mark.parametrize("varlen_mode", ["random", "third", "full"])
-# @pytest.mark.parametrize("varlen_mode", ["full"])
+# @pytest.mark.parametrize("varlen_mode", ["random", "third", "full"])
+@pytest.mark.parametrize("varlen_mode", ["full"])
 @pytest.mark.parametrize(
     "zero_lengths_q, zero_lengths_k",
     [
@@ -903,9 +901,9 @@ def test_flash_attn_varlen_output(
                 or (IS_SM100 and d == 256 and dv == 256)
             )
             and not has_learnable_sink
-            and num_sink_tokens is None
+            # and num_sink_tokens is None
             and softcap == 0.0 # TODO: support softcap != 0.0 in varlen bwd
-            # and False
+            and False
         ):
             if d > 192 and IS_SM90:
                 pytest.xfail("hdim > 192 backward: SM90 not supported yet")

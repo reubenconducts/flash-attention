@@ -743,11 +743,6 @@ class AttentionMask:
                 )
                 local_row_offset_left = (
                     causal_row_offset - self.window_size_left
-                    + (
-                        self.num_sink_tokens
-                        if const_expr(self.num_sink_tokens is not None)
-                        else 0
-                    )
                     if const_expr(self.window_size_left is not None)
                     else None
                 )
@@ -826,6 +821,7 @@ class AttentionMask:
                           When iterating m_blocks in forward order, only the last m_block may be partial.
         """
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
+        assert not mask_sink or mask_local, "local masking must be active for mask_sink"
         ROW = 0 if const_expr(not self.swap_AB) else 1
         COL = 1 if const_expr(not self.swap_AB) else 0
         # assert t0ScS_t2r[0][COL] == 0, "col0 == 0" # tmp comment for 2-cta bwd
@@ -957,28 +953,47 @@ class AttentionMask:
                         row_idx = t0ScS_t2r[i][ROW]
                         local_mask = row_idx < row_limit_top
                         if const_expr(self.window_size_left is not None):
-                            local_mask |= row_idx > row_limit_bot
+                            left_masked = row_idx > row_limit_bot
+                            if const_expr(mask_sink and self.num_sink_tokens is not None):
+                                global_kv = tScS_t2r[i][COL] + n_block * self.tile_n
+                                sink_limit = cutlass.min(self.num_sink_tokens, self.seqlen_k)
+                                is_sink_col = global_kv < sink_limit
+                                left_masked = left_masked and not is_sink_col
+                            local_mask = local_mask or left_masked
                         acc_S[i] = -cutlass.Float32.inf if local_mask else acc_S[i]
                 else:
+                    num_rep = cute.size(tScS_t2r, mode=[0])
+                    num_wg = 2
+                    row_limit = row_to_r2p_idx(row_limit_top, num_rep, num_wg)
+                    if const_expr(self.window_size_left is not None):
+                        row_limit_bottom = row_to_r2p_idx(row_limit_bot + 1, num_rep, num_wg)
 
-                    def mask_gen_fn(s: int) -> Uint32:
-                        num_rep = cute.size(tScS_t2r, mode=[0])
-                        num_wg = 2
+                    if const_expr(not mask_sink):
+                        def mask_gen_fn(s: int) -> Uint32:
+                            mask = r2p_bitmask_above(row_limit, s)
+                            if const_expr(self.window_size_left is not None):
+                                mask = mask & r2p_bitmask_below(row_limit_bottom, s)
+                            return mask
 
-                        row_limit = row_to_r2p_idx(row_limit_top, num_rep, num_wg)
-                        mask = r2p_bitmask_above(row_limit, s)
-
+                        mask_r2p_lambda(acc_S, mask_gen_fn, rank1=True)
+                    else:
+                        assert self.num_sink_tokens is not None
+                        sink_col_limit = self.num_sink_tokens - n_block * self.tile_n - thr_col_offset
+                        is_sink_col = (sink_col_limit > 0) and (seqlenk_col_limit > 0)
+                        # Neutralize the left-window (bottom) bound for sink columns
+                        ncol_frag = const_expr(cute.size(acc_S))
                         if const_expr(self.window_size_left is not None):
-                            row_limit_bottom = row_to_r2p_idx(row_limit_bot + 1, num_rep, num_wg)
-                            mask = mask & r2p_bitmask_below(row_limit_bottom, s)
-
-                        return mask
-
-                    mask_r2p_lambda(
-                        acc_S,
-                        mask_gen_fn,
-                        rank1=True,
-                    )
+                            row_limit_bottom_eff = (
+                                Int32(ncol_frag) if is_sink_col else row_limit_bottom
+                            )
+                    
+                        def mask_gen_fn(s: int) -> Uint32:
+                            mask = r2p_bitmask_above(row_limit, s)
+                            if const_expr(self.window_size_left is not None):
+                                mask = mask & r2p_bitmask_below(row_limit_bottom_eff, s)
+                            return mask
+                    
+                        mask_r2p_lambda(acc_S, mask_gen_fn, rank1=True)
 
 
 # -----------------------------------------------------------------------------

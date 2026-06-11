@@ -54,6 +54,7 @@ class FlashAttentionBackwardSm100:
         head_dim_v: Optional[int] = None,
         is_causal: bool = False,
         is_local: bool = False,
+        has_sink_tokens: bool = False,
         qhead_per_kvhead: cutlass.Constexpr[int] = 1,
         tile_m: int = 128,
         tile_n: int = 128,
@@ -109,6 +110,8 @@ class FlashAttentionBackwardSm100:
         self.is_persistent = is_persistent
         self.is_causal = is_causal
         self.is_local = is_local
+        self.has_sink_tokens = has_sink_tokens
+        assert not self.has_sink_tokens or self.is_local, "sink tokens are only supported for local attention"
         self.qhead_per_kvhead = qhead_per_kvhead
         self.pack_gqa = False
         self.deterministic = deterministic
@@ -455,6 +458,7 @@ class FlashAttentionBackwardSm100:
         mSeqUsedK: Optional[cute.Tensor] = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
+        num_sink_tokens: Int32 | int | None = None,
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
@@ -729,6 +733,7 @@ class FlashAttentionBackwardSm100:
             is_persistent=self.is_persistent,  # persistent mode not tested
             lpt=self.spt,
             head_swizzle=self.deterministic,
+            has_sink_tokens=self.has_sink_tokens,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
@@ -910,6 +915,8 @@ class FlashAttentionBackwardSm100:
             window_size_left = Int32(window_size_left)
         if const_expr(window_size_right is not None):
             window_size_right = Int32(window_size_right)
+        if const_expr(num_sink_tokens is not None):
+            num_sink_tokens = Int32(num_sink_tokens)
 
         fastdiv_mods = None
         if const_expr(aux_data.tensors is not None):
@@ -992,6 +999,7 @@ class FlashAttentionBackwardSm100:
             softmax_scale_log2,
             window_size_left,
             window_size_right,
+            num_sink_tokens,
             tile_sched_params,
             aux_data,
             fastdiv_mods,
@@ -1005,7 +1013,7 @@ class FlashAttentionBackwardSm100:
             min_blocks_per_mp=1,
         )
 
-    def _generate_attention_mask_cls(self, window_size_left, window_size_right):
+    def _generate_attention_mask_cls(self, window_size_left, window_size_right, num_sink_tokens):
         return partial(
             AttentionMask,
             self.tile_m,
@@ -1013,6 +1021,7 @@ class FlashAttentionBackwardSm100:
             swap_AB=True,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
+            num_sink_tokens=num_sink_tokens,
         )
 
     @cute.kernel
@@ -1075,6 +1084,7 @@ class FlashAttentionBackwardSm100:
         softmax_scale_log2: cutlass.Float32,
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
+        num_sink_tokens: Optional[Int32],
         tile_sched_params: ParamsBase,
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
@@ -1400,6 +1410,7 @@ class FlashAttentionBackwardSm100:
             tile_n=self.tile_n * self.cluster_shape_mnk[0],  # careful, this case is not very well-tested
             is_causal=self.is_causal,
             is_local=self.is_local,
+            has_sink_tokens=self.has_sink_tokens,
             is_split_kv=False,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
@@ -1418,7 +1429,9 @@ class FlashAttentionBackwardSm100:
         )
         TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
 
-        AttentionMaskCls = self._generate_attention_mask_cls(window_size_left, window_size_right)
+        AttentionMaskCls = self._generate_attention_mask_cls(
+            window_size_left, window_size_right, num_sink_tokens
+        )
         #  EMPTY
         # (15)
         if warp_idx == self.empty_warp_id:
@@ -1639,8 +1652,12 @@ class FlashAttentionBackwardSm100:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+            n_block_cta_group = n_block // self.cluster_shape_mnk[0]
+            is_sink_tile = False
+            if const_expr(self.has_sink_tokens):
+                is_sink_tile = n_block_cta_group == 0
             m_block_min, m_block_max = block_info.get_m_block_min_max(
-                seqlen, n_block // self.cluster_shape_mnk[0]
+                seqlen, n_block_cta_group, is_sink_tile=is_sink_tile
             )
             head_idx_kv = head_idx // self.qhead_per_kvhead
 
@@ -1750,11 +1767,14 @@ class FlashAttentionBackwardSm100:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+            n_block_cta_group = n_block // self.cta_group_size
+            is_sink_tile = False
+            if const_expr(self.has_sink_tokens):
+                is_sink_tile = n_block_cta_group == 0
             m_block_min, m_block_max = block_info.get_m_block_min_max(
-                seqlen, n_block // self.cluster_shape_mnk[0]
+                seqlen, n_block_cta_group, is_sink_tile=is_sink_tile
             )
             head_idx_kv = head_idx // self.qhead_per_kvhead
-            n_block_cta_group = n_block // self.cta_group_size
 
             # GMEM tensors (varlen-aware)
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
@@ -2356,8 +2376,12 @@ class FlashAttentionBackwardSm100:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)  # must be seqlen_k
+            n_block_cta_group = n_block // self.cluster_shape_mnk[0]
+            is_sink_tile = False
+            if const_expr(self.has_sink_tokens):
+                is_sink_tile = n_block_cta_group == 0
             m_block_min, m_block_max = block_info.get_m_block_min_max(
-                seqlen, n_block // self.cluster_shape_mnk[0]
+                seqlen, n_block_cta_group, is_sink_tile=is_sink_tile
             )
 
             if const_expr(self.use_block_sparsity):
@@ -2974,11 +2998,14 @@ class FlashAttentionBackwardSm100:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+            cluster_n_block = n_block // self.cta_group_size
+            is_sink_tile = False
+            if const_expr(self.has_sink_tokens):
+                is_sink_tile = cluster_n_block == 0
             m_block_min, m_block_max = block_info.get_m_block_min_max(
-                seqlen, n_block // self.cluster_shape_mnk[0]
+                seqlen, cluster_n_block, is_sink_tile=is_sink_tile
             )
             mask = AttentionMaskCls(seqlen)
-            cluster_n_block = n_block // self.cta_group_size
             # TODO: condition mask_seqlen
             mask_fn = partial(
                 mask.apply_mask_sm100_transposed,
@@ -3091,12 +3118,30 @@ class FlashAttentionBackwardSm100:
 
                 #### APPLY MASK (after score_mod, matching forward pass order)
                 check_m_boundary = (m_block + 1) * self.tile_m > seqlen.seqlen_q
-                mask_fn(
-                    tSrS_t2r,
-                    m_block=m_block,
-                    is_full_block=is_full_block,
-                    check_m_boundary=check_m_boundary,
-                )
+                if const_expr(self.has_sink_tokens):
+                    if cluster_n_block == 0:
+                        mask_fn(
+                            tSrS_t2r,
+                            m_block=m_block,
+                            mask_sink=True,
+                            is_full_block=is_full_block,
+                            check_m_boundary=check_m_boundary,
+                        )
+                    else:
+                        mask_fn(
+                            tSrS_t2r,
+                            m_block=m_block,
+                            mask_sink=False,
+                            is_full_block=is_full_block,
+                            check_m_boundary=check_m_boundary,
+                        )
+                else:
+                    mask_fn(
+                        tSrS_t2r,
+                        m_block=m_block,
+                        is_full_block=is_full_block,
+                        check_m_boundary=check_m_boundary,
+                    )
                 num_stages = cute.size(tScS_t2r, mode=[1])
                 # ---------------------------------------------
                 #### P = exp(S - LSE)
@@ -3440,8 +3485,15 @@ class FlashAttentionBackwardSm100:
     ) -> Int32:
         lock_value = n_block
         if const_expr(self.spt):
-            n_block_max_for_m_block = block_info.get_n_block_max_for_m_block(seqlen, m_block)
+            n_block_min_for_m_block, n_block_max_for_m_block = block_info.get_n_block_min_max(seqlen, m_block)
             lock_value = n_block_max_for_m_block - 1 - n_block
+            if const_expr(self.has_sink_tokens):
+                is_sink_block = (
+                    (n_block_min_for_m_block != 0 or n_block_max_for_m_block <= 0)
+                    and n_block == 0
+                )
+                sink_lock_value = cutlass.max(n_block_max_for_m_block - n_block_min_for_m_block, Int32(0))
+                lock_value = sink_lock_value if is_sink_block else lock_value
         if const_expr(self.use_block_sparsity):
             assert blocksparse_tensors is not None
             if const_expr(blocksparse_tensors.dq_write_order is not None):
@@ -3512,7 +3564,12 @@ class FlashAttentionBackwardSm100:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             n_block_cta_group = n_block // self.cta_group_size  # for 2cta
             seqlen = SeqlenInfoCls(batch_idx)
-            m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block_cta_group)
+            is_sink_tile = False
+            if const_expr(self.has_sink_tokens):
+                is_sink_tile = n_block_cta_group == 0
+            m_block_min, m_block_max = block_info.get_m_block_min_max(
+                seqlen, n_block_cta_group, is_sink_tile=is_sink_tile
+            )
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mdQaccum_cur = mdQaccum[None, head_idx, batch_idx]
             else:

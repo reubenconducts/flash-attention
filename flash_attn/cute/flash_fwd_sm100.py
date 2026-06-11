@@ -1068,7 +1068,6 @@ class FlashAttentionForwardSm100:
             is_split_kv=self.is_split_kv,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
-            num_sink_tokens=num_sink_tokens,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
         SeqlenInfoCls = partial(
@@ -1479,67 +1478,56 @@ class FlashAttentionForwardSm100:
                     seqlen, m_block, split_idx, num_splits
                 )
                 if const_expr(self.has_sink_tokens):
+                    load_sink_K = load_K
+                    load_sink_V = load_V
                     # Sink tokens are always processed as logical block 0 before the regular
                     # local-window mainloop. Keep block 0 out of the regular loop.
                     n_block_zero = Int32(0)
-                    page_idx = (
-                        mPageTable[batch_idx, n_block_zero]
-                        if const_expr(mPageTable is not None and self.use_tma_KV)
-                        else None
+                    q_producer_phase, kv_producer_state = self.load_one_iter(
+                        batch_idx,
+                        load_Q,
+                        load_sink_K,
+                        load_sink_V,
+                        n_block_zero,
+                        paged_kv_manager,
+                        issue_kv_for_this_warp,
+                        issue_q_for_this_warp,
+                        q_producer_phase,
+                        kv_producer_state,
+                        mPageTable,
                     )
-                    if const_expr(not self.use_tma_KV):
-                        paged_kv_manager.load_page_table(n_block_zero)
-                    if issue_kv_for_this_warp:
-                        load_K(block=n_block_zero, producer_state=kv_producer_state, page_idx=page_idx)  # K_sink
-                    if issue_q_for_this_warp:
-                        load_Q(block=n_block_zero, stage=0)
-                    if issue_kv_for_this_warp:
-                        kv_producer_state.advance()
-                    if const_expr(self.q_stage == 2) and issue_q_for_this_warp:
-                        load_Q(block=Int32(1), stage=1)
-                    q_producer_phase ^= 1
-                    if issue_kv_for_this_warp:
-                        load_V(block=n_block_zero, producer_state=kv_producer_state, page_idx=page_idx)  # V_sink
-                        kv_producer_state.advance()
+                    issue_q_for_this_warp = False
 
                 if (const_expr(not self.has_sink_tokens and not self.is_split_kv) or n_block_min < n_block_max):
                     n_block_first = n_block_max - 1 if n_block_max > 0 else 0
-                    page_idx = (
-                        mPageTable[batch_idx, n_block_first]
-                        if const_expr(mPageTable is not None and self.use_tma_KV)
-                        else None
+                    q_producer_phase, kv_producer_state = self.load_one_iter(
+                        batch_idx,
+                        load_Q,
+                        load_K,
+                        load_V,
+                        n_block_first,
+                        paged_kv_manager,
+                        issue_kv_for_this_warp,
+                        issue_q_for_this_warp,
+                        q_producer_phase,
+                        kv_producer_state,
+                        mPageTable,
                     )
-                    if const_expr(not self.use_tma_KV):
-                        paged_kv_manager.load_page_table(n_block_first)
-                    if issue_kv_for_this_warp:
-                        load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0
-                    # load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx, extra_tx_count=self.tma_copy_bytes["Q"])  # K0
-                    if const_expr(not self.has_sink_tokens) and issue_q_for_this_warp:
-                        load_Q(block=0, stage=0)
-                    if issue_kv_for_this_warp:
-                        kv_producer_state.advance()
-                    if const_expr(not self.has_sink_tokens and self.q_stage == 2) and issue_q_for_this_warp:
-                        load_Q(block=1, stage=1)
-                    if const_expr(not self.has_sink_tokens):
-                        q_producer_phase ^= 1
-                    if issue_kv_for_this_warp:
-                        load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0
-                        kv_producer_state.advance()
                     for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                         n_block = n_block_max - 2 - i
-                        page_idx = (
-                            mPageTable[batch_idx, n_block]
-                            if const_expr(mPageTable is not None and self.use_tma_KV)
-                            else None
+                        q_producer_phase, kv_producer_state = self.load_one_iter(
+                            batch_idx,
+                            load_Q,
+                            load_K,
+                            load_V,
+                            n_block,
+                            paged_kv_manager,
+                            issue_kv_for_this_warp,
+                            False, # issue_q_for_this_warp
+                            q_producer_phase,
+                            kv_producer_state,
+                            mPageTable,
                         )
-                        if const_expr(not self.use_tma_KV):
-                            paged_kv_manager.load_page_table(n_block)
-                    # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("n_block = {}, page_idx = {}", n_block, page_idx)
-                        if issue_kv_for_this_warp:
-                            load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Ki
-                            kv_producer_state.advance()
-                            load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Vi
-                            kv_producer_state.advance()
 
             else:
                 kv_producer_state, q_producer_phase = produce_block_sparse_loads_sm100(
@@ -1570,6 +1558,45 @@ class FlashAttentionForwardSm100:
         # This is equivalent to pipeline_q.producer_tail for the TMA-Q producer warp.
         if issue_q_for_this_warp:
             pipeline_q.producer_acquire_w_index_phase(self.q_stage - 1, q_producer_phase)
+
+    @cute.jit 
+    def load_one_iter(
+        self,
+        batch_idx: Int32,
+        load_Q_fn: Callable,
+        load_K_fn: Callable,
+        load_V_fn: Callable,
+        n_block: Int32,
+        paged_kv_manager: Optional[PagedKVManager],
+        issue_kv_for_this_warp: cutlass.Constexpr[Boolean],
+        issue_q_for_this_warp: cutlass.Constexpr[Boolean],
+        q_producer_phase: Int32,
+        kv_producer_state: pipeline.PipelineState,
+        mPageTable: Optional[cute.Tensor],
+    ):
+        page_idx = (
+            mPageTable[batch_idx, n_block]
+            if const_expr(mPageTable is not None and self.use_tma_KV)
+            else None
+        )
+        if const_expr(not self.use_tma_KV):
+            paged_kv_manager.load_page_table(n_block)
+        if issue_kv_for_this_warp:
+            load_K_fn(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
+        if issue_q_for_this_warp:
+            load_Q_fn(block=0, stage=0)
+        if issue_kv_for_this_warp:
+            kv_producer_state.advance()
+        if const_expr(self.q_stage == 2) and issue_q_for_this_warp:
+            load_Q_fn(block=1, stage=1)
+            q_producer_phase ^= 1
+        elif issue_q_for_this_warp:
+            q_producer_phase ^= 1
+        if issue_kv_for_this_warp:
+            load_V_fn(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
+            kv_producer_state.advance()
+
+        return q_producer_phase, kv_producer_state
 
     @cute.jit
     def mma(
@@ -3113,9 +3140,8 @@ class FlashAttentionForwardSm100:
         else:
             return sX
 
-    @cute.jit
-    def load_KV_sink_tokens(self, tXgX: Optional[cute.Tensor], tXsX: Optional[cute.Tensor]):
-        pass
+
+        
     # @cute.jit
     # def warp_scheduler_barrier_init(self):
     #     warp_group_idx = utils.canonical_warp_group_idx(sync=False)
