@@ -69,7 +69,7 @@ VERBOSE = True
 # @pytest.mark.parametrize("has_learnable_sink", [False, True])
 @pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("num_sink_tokens", [None, 1, 4, 16, 32])
-@pytest.mark.parametrize("num_sink_tokens", [None])
+@pytest.mark.parametrize("num_sink_tokens", [4])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
@@ -901,9 +901,8 @@ def test_flash_attn_varlen_output(
                 or (IS_SM100 and d == 256 and dv == 256)
             )
             and not has_learnable_sink
-            # and num_sink_tokens is None
             and softcap == 0.0 # TODO: support softcap != 0.0 in varlen bwd
-            and False
+            # and False
         ):
             if d > 192 and IS_SM90:
                 pytest.xfail("hdim > 192 backward: SM90 not supported yet")
@@ -1038,6 +1037,7 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("has_learnable_sink", [False, True])
 # @pytest.mark.parametrize("has_learnable_sink", [False])
+@pytest.mark.parametrize("num_sink_tokens", [None, 1, 4, 32])
 # @pytest.mark.parametrize("new_kv", [False, True])
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("local", [False, True])
@@ -1104,6 +1104,7 @@ def test_flash_attn_kvcache(
     causal,
     local,
     new_kv,
+    num_sink_tokens,
     has_learnable_sink,
     mha_type,
     dtype,
@@ -1116,6 +1117,9 @@ def test_flash_attn_kvcache(
         pytest.skip()
     if rotary_fraction == 0.0 and has_rotary_seqlens:
         pytest.skip()
+    if num_sink_tokens is not None:
+        if not local:
+            pytest.skip("sink tokens only used with local")
     device = "cuda"
     # set seed
     seed = 0
@@ -1408,6 +1412,7 @@ def test_flash_attn_kvcache(
             causal=causal,
             qv=qv,
             window_size=window_size,
+            sink_token_length=num_sink_tokens if num_sink_tokens is not None else 0,
             learnable_sink=learnable_sink,
             attention_chunk=attention_chunk,
             key_leftpad=cache_leftpad,
@@ -1421,6 +1426,7 @@ def test_flash_attn_kvcache(
             causal=causal,
             qv=qv,
             window_size=window_size,
+            sink_token_length=num_sink_tokens if num_sink_tokens is not None else 0,
             learnable_sink=learnable_sink,
             attention_chunk=attention_chunk,
             upcast=False,
@@ -1446,7 +1452,7 @@ def test_flash_attn_kvcache(
         v_cache_saved = v_cache.clone() if page_size is None else v_cache_paged.clone()
         # num_splits_vals = [1, 0]
         # SplitKV is not supported for hdim >= 192
-        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
+        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and num_sink_tokens is None else [1]
         # precompute_metadata_vals = [False, True]
         precompute_metadata_vals = [False]
         for num_splits, precompute_metadata in itertools.product(
@@ -1494,6 +1500,7 @@ def test_flash_attn_kvcache(
                     # rotary_seqlens=rotary_seqlens,
                     causal=causal,
                     window_size=window_size,
+                    num_sink_tokens=num_sink_tokens,
                     learnable_sink=learnable_sink,
                     # attention_chunk=attention_chunk,
                     # rotary_interleaved=rotary_interleaved,

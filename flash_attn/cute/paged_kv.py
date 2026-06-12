@@ -1,4 +1,4 @@
-from typing import Type
+from typing import Optional, Type
 from dataclasses import dataclass
 
 import cutlass
@@ -90,7 +90,6 @@ class PagedKVManager(ParamsBase):
 
         tPrPage = cute.make_rmem_tensor((page_entry_per_thread,), Int32)
         tPrPageOffset = cute.make_rmem_tensor((page_entry_per_thread,), Int32)
-
         mPageTable = mPageTable[bidb, None]
         mK_paged = mK_paged[None, None, bidh, None]
         mV_paged = mV_paged[None, None, bidh, None]
@@ -134,7 +133,7 @@ class PagedKVManager(ParamsBase):
         )
 
     @cute.jit
-    def load_page_table(self, n_block: Int32):
+    def load_page_table(self, n_block: Int32, row_limit: Optional[Int32] = None):
         for i in cutlass.range(self.page_entry_per_thread, unroll=1):
             row = (
                 i * self.num_threads
@@ -149,6 +148,8 @@ class PagedKVManager(ParamsBase):
             is_valid = (
                 (i + 1) * self.num_threads <= self.n_block_size or row < self.n_block_size
             ) and row_idx < self.seqlen_k
+            if const_expr(row_limit is not None):
+                is_valid = is_valid and row < row_limit
             page = self.mPageTable[page_idx] if is_valid else 0
 
             self.tPrPage[i] = page
@@ -157,11 +158,11 @@ class PagedKVManager(ParamsBase):
     @cute.jit
     def compute_X_ptr(self, K_or_V: str, d_offset: int = 0):
         tPrXPtr = cute.make_rmem_tensor((self.page_entry_per_thread,), cutlass.Int64)
-        mX = self.mK_paged if const_expr(K_or_V == "K") else self.mV_paged
         # K is always (page_size, d, num_pages). V matches K when not transposed,
         # but is (dv, page_size, num_pages) when transposed (SM100).
         transposed = const_expr(K_or_V == "V" and self.v_gmem_transposed)
         for i in cutlass.range(self.page_entry_per_thread, unroll=1):
+            mX = self.mK_paged if const_expr(K_or_V == "K") else self.mV_paged
             page = self.tPrPage[i]
             page_offset = self.tPrPageOffset[i]
             if const_expr(transposed):
@@ -207,10 +208,17 @@ class PagedKVManager(ParamsBase):
             )
 
     @cute.jit
-    def load_KV(self, n_block: Int32, sX: cute.Tensor, K_or_V: str):
+    def load_KV(
+        self,
+        n_block: Int32,
+        sX: cute.Tensor,
+        K_or_V: str,
+        row_limit: Optional[Int32] = None,
+    ):
         assert K_or_V in ("K", "V")
 
         tPrXPtr = self.compute_X_ptr(K_or_V)
+        element_type = self.mK_paged.element_type
 
         if const_expr(self.arch == 90):
             # SM90: sX is already stage-sliced by caller (sK[None, None, stage]).
@@ -229,6 +237,8 @@ class PagedKVManager(ParamsBase):
         seqlenk_row_limit = (
             self.seqlen_k - n_block * self.n_block_size - tXcX[0][0] if n_block >= 0 else 0
         )
+        if const_expr(row_limit is not None):
+            seqlenk_row_limit = cutlass.min(seqlenk_row_limit, row_limit - tXcX[0][0])
         for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
             row_valid = tXc0X[0, m, 0][0] < seqlenk_row_limit
             should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], cute.Boolean)
@@ -240,7 +250,7 @@ class PagedKVManager(ParamsBase):
                 width=self.gmem_threads_per_row,
             )
             x_gmem_ptr = cute.make_ptr(
-                self.mK_paged.element_type, x_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
+                element_type, x_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
             )
             mX_paged_cur = cute.make_tensor(x_gmem_ptr, cute.make_layout((head_dim,)))
             mX_paged_cur_copy = cute.tiled_divide(mX_paged_cur, (self.async_copy_elems,))

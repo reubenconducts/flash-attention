@@ -19,6 +19,7 @@ class BlockInfo:
     is_split_kv: cutlass.Constexpr[bool] = False
     window_size_left: Optional[Int32] = None
     window_size_right: Optional[Int32] = None
+    num_sink_tokens: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
 
     @cute.jit
@@ -64,6 +65,22 @@ class BlockInfo:
             n_block_min = n_block_min + split_idx * num_n_blocks_per_split
             n_block_max = cutlass.min(n_block_min + num_n_blocks_per_split, n_block_max)
         return n_block_min, n_block_max
+
+    @cute.jit
+    def sink_block_is_partial(
+        self,
+        seqlen_info: SeqlenInfoQK,
+        m_block: Int32,
+    ) -> cutlass.Boolean:
+        if const_expr(not self.has_sink_tokens or self.window_size_left is None):
+            return cutlass.Boolean(False)
+        m_idx_min = m_block * self.tile_m
+        if const_expr(self.qhead_per_kvhead_packgqa > 1):
+            m_idx_min = m_idx_min // self.qhead_per_kvhead_packgqa
+        n_idx_left = (
+            m_idx_min + seqlen_info.seqlen_k - seqlen_info.seqlen_q
+        ) - self.window_size_left
+        return cutlass.max(n_idx_left // self.tile_n, 0) >= Int32(1)
 
     @cute.jit
     def get_m_block_min_max(

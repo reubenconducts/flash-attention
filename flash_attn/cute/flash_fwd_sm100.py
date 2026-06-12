@@ -1068,6 +1068,7 @@ class FlashAttentionForwardSm100:
             is_split_kv=self.is_split_kv,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
+            num_sink_tokens=num_sink_tokens,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
         SeqlenInfoCls = partial(
@@ -1478,25 +1479,32 @@ class FlashAttentionForwardSm100:
                     seqlen, m_block, split_idx, num_splits
                 )
                 if const_expr(self.has_sink_tokens):
-                    load_sink_K = load_K
-                    load_sink_V = load_V
                     # Sink tokens are always processed as logical block 0 before the regular
                     # local-window mainloop. Keep block 0 out of the regular loop.
-                    n_block_zero = Int32(0)
+                    if const_expr(not self.use_tma_KV):
+                        sink_row_limit = (
+                            cutlass.min(block_info.num_sink_tokens, seqlen.seqlen_k)
+                            if block_info.sink_block_is_partial(seqlen, m_block)
+                            else Int32(self.n_block_size)
+                        )
+                    else:
+                        sink_row_limit = None
                     q_producer_phase, kv_producer_state = self.load_one_iter(
                         batch_idx,
                         load_Q,
-                        load_sink_K,
-                        load_sink_V,
-                        n_block_zero,
+                        load_K,
+                        load_V,
+                        Int32(0),
                         paged_kv_manager,
                         issue_kv_for_this_warp,
                         issue_q_for_this_warp,
                         q_producer_phase,
                         kv_producer_state,
                         mPageTable,
+                        row_limit=sink_row_limit,
                     )
                     issue_q_for_this_warp = False
+
 
                 if (const_expr(not self.has_sink_tokens and not self.is_split_kv) or n_block_min < n_block_max):
                     n_block_first = n_block_max - 1 if n_block_max > 0 else 0
@@ -1513,6 +1521,7 @@ class FlashAttentionForwardSm100:
                         kv_producer_state,
                         mPageTable,
                     )
+                    issue_q_for_this_warp = False
                     for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                         n_block = n_block_max - 2 - i
                         q_producer_phase, kv_producer_state = self.load_one_iter(
@@ -1523,7 +1532,7 @@ class FlashAttentionForwardSm100:
                             n_block,
                             paged_kv_manager,
                             issue_kv_for_this_warp,
-                            False, # issue_q_for_this_warp
+                            issue_q_for_this_warp,
                             q_producer_phase,
                             kv_producer_state,
                             mPageTable,
@@ -1573,6 +1582,7 @@ class FlashAttentionForwardSm100:
         q_producer_phase: Int32,
         kv_producer_state: pipeline.PipelineState,
         mPageTable: Optional[cute.Tensor],
+        row_limit: Optional[Int32] = None,
     ):
         page_idx = (
             mPageTable[batch_idx, n_block]
@@ -1580,9 +1590,9 @@ class FlashAttentionForwardSm100:
             else None
         )
         if const_expr(not self.use_tma_KV):
-            paged_kv_manager.load_page_table(n_block)
+            paged_kv_manager.load_page_table(n_block, row_limit=row_limit)
         if issue_kv_for_this_warp:
-            load_K_fn(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
+            load_K_fn(block=n_block, producer_state=kv_producer_state, page_idx=page_idx, row_limit=row_limit)
         if issue_q_for_this_warp:
             load_Q_fn(block=0, stage=0)
         if issue_kv_for_this_warp:
@@ -1593,7 +1603,7 @@ class FlashAttentionForwardSm100:
         elif issue_q_for_this_warp:
             q_producer_phase ^= 1
         if issue_kv_for_this_warp:
-            load_V_fn(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
+            load_V_fn(block=n_block, producer_state=kv_producer_state, page_idx=page_idx, row_limit=row_limit)
             kv_producer_state.advance()
 
         return q_producer_phase, kv_producer_state
@@ -3091,6 +3101,7 @@ class FlashAttentionForwardSm100:
         K_or_V: Literal["K", "V"],
         page_idx: Optional[Int32] = None,
         extra_tx_count: Optional[Int32] = None,
+        row_limit: Optional[Int32] = None,
     ):
         assert K_or_V in ("K", "V")
         stage, phase = producer_state.index, producer_state.phase
@@ -3122,7 +3133,7 @@ class FlashAttentionForwardSm100:
             sX_cur = sX[None, None, None, stage]
             if const_expr(self.uneven_kv_smem):
                 sX_cur = self.offset_kv_smem(sX_cur, stage, phase ^ 1)
-            paged_kv_manager.load_KV(block, sX_cur, K_or_V)
+            paged_kv_manager.load_KV(block, sX_cur, K_or_V, row_limit=row_limit)
             cute.arch.cp_async_commit_group()
             pipeline_kv.sync_object_full.arrive_cp_async_mbarrier(stage)
 
