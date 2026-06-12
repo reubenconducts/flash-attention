@@ -41,6 +41,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         qhead_per_kvhead: int = 1,
         is_causal: bool = False,
         is_local: bool = False,
+        has_sink_tokens: bool = False,
         is_split_kv: bool = False,
         pack_gqa: bool = False,
         q_subtile_factor: int | None = None,
@@ -74,6 +75,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         assert m_block_size == 128 and n_block_size == 128, (
             "SM100 dedicated kernel only supports tile_m=128 and tile_n=128"
         )
+        assert not has_sink_tokens, "SM100 forward with head_dim=256 does not support sink tokens"
         # q_stage / persistence / scheduler knobs are accepted for interface parity,
         # but this dedicated kernel uses fixed internal settings.
 
@@ -177,6 +179,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         mPageTable: Optional[cute.Tensor] = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
+        num_sink_tokens: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[cute.Tensor] = None,
@@ -205,6 +208,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         assert window_size_left is None and window_size_right is None, (
             "SM100 forward with head_dim=256 does not support runtime window_size overrides"
+        )
+        assert num_sink_tokens is None, (
+            "SM100 forward with head_dim=256 does not support sink tokens"
         )
         assert descale_tensors is None, (
             "SM100 forward with head_dim=256 does not support descale_tensors"

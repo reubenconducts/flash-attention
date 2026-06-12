@@ -203,6 +203,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
         seqused_k: cute.Tensor | None = None,
         window_size_left: Int32 | None = None,
         window_size_right: Int32 | None = None,
+        num_sink_tokens: Int32 | int | None = None,
         dQ_semaphore: cute.Tensor | None = None,
         dK_semaphore: cute.Tensor | None = None,
         dV_semaphore: cute.Tensor | None = None,
@@ -216,6 +217,9 @@ class BlackwellFusedMultiHeadAttentionBackward:
         )
         assert window_size_left is None and window_size_right is None, (
             "SM100 backward with head_dim=256 uses constructor-provided window sizes"
+        )
+        assert num_sink_tokens is None, (
+            "SM100 backward with head_dim=256 does not support sink tokens"
         )
         assert dQ_semaphore is None and dK_semaphore is None and dV_semaphore is None, (
             "SM100 backward with head_dim=256 does not use semaphores"

@@ -503,6 +503,8 @@ def _flash_attn_fwd(
         assert q_descale is None and k_descale is None and v_descale is None, (
             "q_descale/k_descale/v_descale are only supported for FP8 inputs"
         )
+    if has_sink_tokens:
+        assert arch // 10 in [10, 11], "sink tokens currently only supported on Sm100"
 
     dtype = torch2cute_dtype_map[q_dtype]
     if is_fp8:
@@ -892,6 +894,8 @@ def _flash_attn_fwd(
                         "SM100 forward with head_dim=256 does not support block sparsity"
                     assert learnable_sink is None, \
                         "SM100 forward with head_dim=256 does not support learnable_sink"
+                    assert not has_sink_tokens, \
+                        "SM100 forward with head_dim=256 does not support sink tokens"
                     assert seqused_q is None and seqused_k is None, \
                         "SM100 forward with head_dim=256 does not support seqused_q/seqused_k"
                     if page_table is not None:
@@ -1381,6 +1385,8 @@ def _flash_attn_bwd(
         use_2cta_instrs = cluster_size==2
 
     has_sink_tokens = num_sink_tokens is not None and num_sink_tokens > 0
+    if has_sink_tokens:
+        assert arch // 10 in [10, 11], "sink tokens currently supported only on Sm100"
 
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
