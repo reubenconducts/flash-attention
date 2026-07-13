@@ -554,7 +554,16 @@ def _flash_attn_fwd(
         min_seqlen_k = seqlen_k 
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
     if arch // 10 in [10, 11]:
-        q_stage = 2 if seqlen_q_packgqa > tile_m else 1
+        # hdim 192 varlen MHA noncausal: q_stage=1 measured faster on all swept shapes.
+        # Causal prefers q_stage=2 and GQA is shape-dependent, so both keep the default.
+        hd192_varlen_mha_nc = (
+            int(math.ceil(head_dim / 16) * 16) == 192
+            and (cu_seqlens_q is not None or seqused_q is not None)
+            and not causal
+            and not local
+            and qhead_per_kvhead == 1
+        )
+        q_stage = 1 if hd192_varlen_mha_nc else (2 if seqlen_q_packgqa > tile_m else 1)
     else:
         q_stage = 1
 
@@ -622,12 +631,17 @@ def _flash_attn_fwd(
         or seqused_k is not None
     )
 
-    # CLC regressed for varlen MHA and dense noncausal. Imbalanced varlen shapes
-    # keep more K/V blocks in flight and hurt L2; dense noncausal mostly just
-    # pays work-stealing overhead.
-    is_varlen_mha = is_varlen and qhead_per_kvhead == 1
     is_dense_noncausal = not is_varlen and not causal and not local
-    use_clc_scheduler = requested_use_clc_scheduler and not is_varlen_mha and not is_dense_noncausal
+    if requested_use_clc_scheduler is None:
+        use_clc_scheduler = (
+            arch // 10 in [10, 11]
+            and is_varlen
+            and not use_block_sparsity
+            and not use_dedicated_hd256_kernel
+        )
+    else:
+        # FA_CLC set explicitly: honor it except for dense noncausal, which regresses.
+        use_clc_scheduler = requested_use_clc_scheduler and not is_dense_noncausal
 
     if use_block_sparsity:
         # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)
@@ -929,7 +943,8 @@ def _flash_attn_fwd(
                         and not local
                         and cu_seqlens_q is None
                         and seqused_q is None
-                        and not is_split_kv,
+                        and not is_split_kv
+                        and head_dim > 64,
                     score_mod=score_mod,
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
