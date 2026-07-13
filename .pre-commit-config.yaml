@@ -7,9 +7,9 @@ repos:
         files: ^flash_attn/cute/.*\.py$
         exclude: &cute_exclude |
           (?x)^flash_attn/cute/(
-            flash_bwd|
-            flash_fwd|
-            flash_fwd_sm100|
+            kernels/backward/flash_bwd|
+            kernels/forward/flash_fwd|
+            kernels/forward/flash_fwd_sm100|
             interface|
           )\.py$
       - id: ruff-format

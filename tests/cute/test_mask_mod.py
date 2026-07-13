@@ -31,7 +31,7 @@ from flash_attn.cute.block_sparsity import (
     compute_dq_write_order_from_block_mask,
 )
 from flash_attn.cute.cache_utils import get_jit_cache
-from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
+from flash_attn.cute.kernels.block_sparse.compute_block_sparsity import compute_block_sparsity
 from flash_attn.cute import utils
 from mask_mod_definitions import (
     get_mask_pair,

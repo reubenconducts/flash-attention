@@ -9,7 +9,7 @@ except ImportError:
 
 from einops import rearrange
 
-from flash_attn.cute.bench_utils import (
+from flash_attn.cute.bench.bench_utils import (
     flops,
     bandwidth_fwd_bytes,
     bandwidth_bwd_bytes,

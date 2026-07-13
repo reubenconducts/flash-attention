@@ -20,7 +20,7 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from flash_attn.cute.interface import _flash_attn_fwd
 from flash_attn.cute import utils
-from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
+from flash_attn.cute.kernels.block_sparse.compute_block_sparsity import compute_block_sparsity
 from mask_mod_definitions import (
     get_mask_pair,
     get_vec_mask,

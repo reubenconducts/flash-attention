@@ -14,7 +14,7 @@ from cutlass.cute.runtime import from_dlpack
 import numpy as np
 import torch
 
-from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
+from flash_attn.cute.kernels.forward.flash_fwd_sm90 import FlashAttentionForwardSm90
 from mask_mod_definitions import (
     get_mask_pair,
     random_doc_id_tensor,
@@ -23,7 +23,7 @@ from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
     to_cute_block_sparse_tensors,
 )
-from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
+from flash_attn.cute.kernels.block_sparse.compute_block_sparsity import compute_block_sparsity
 
 
 @dataclass
@@ -316,22 +316,24 @@ class FlashAttentionBenchmark:
 
         qhead_per_kvhead = config.nheads // config.nheads_kv
         kernel = FlashAttentionForwardSm90(
-            cute_dtype,
-            config.headdim,
-            config.headdim_v,
-            qhead_per_kvhead,
-            is_causal=config.causal,
-            is_local=config.is_local,
-            pack_gqa=False,
-            tile_m=config.tile_m,
-            tile_n=config.tile_n,
-            num_stages=config.num_stages,
-            num_threads=config.num_threads,
-            intra_wg_overlap=config.intra_wg_overlap,
-            mma_pv_is_rs=config.mma_pv_is_rs,
-            mask_mod=self.mask_mod_cute,
-            Q_in_regs=False,
-            has_aux_tensors=config.has_aux_tensors,
+            FlashAttentionForwardSm90.Params(
+                dtype=cute_dtype,
+                head_dim=config.headdim,
+                head_dim_v=config.headdim_v,
+                qhead_per_kvhead=qhead_per_kvhead,
+                is_causal=config.causal,
+                is_local=config.is_local,
+                pack_gqa=False,
+                tile_m=config.tile_m,
+                tile_n=config.tile_n,
+                num_stages=config.num_stages,
+                num_threads=config.num_threads,
+                intra_wg_overlap=config.intra_wg_overlap,
+                mma_pv_is_rs=config.mma_pv_is_rs,
+                mask_mod=self.mask_mod_cute,
+                Q_in_regs=False,
+                has_aux_tensors=config.has_aux_tensors,
+            )
         )
 
         softmax_scale = 1.0 / math.sqrt(config.headdim)

@@ -28,6 +28,11 @@ torch2cute_dtype_map = {
     torch.float32: cutlass.Float32,
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
     torch.float8_e5m2: cutlass.Float8E5M2,
+    # index/bookkeeping tensors (cu_seqlens, page tables, semaphores)
+    torch.int32: cutlass.Int32,
+    torch.int64: cutlass.Int64,
+    torch.uint8: cutlass.Uint8,
+    torch.bool: cutlass.Boolean,
 }
 
 
@@ -110,6 +115,51 @@ def get_aux_tensor_metadata(aux_tensors):
             hasattr(t, "__leading_dim__"),
         )
         for t in aux_tensors
+    )
+
+
+# Composite-argument hooks for kernel_compiler Args declarations: the AuxData
+# bundle rides through __call__ as one argument whose compile-relevant
+# structure is the aux tensors' metadata descriptors plus the scalars' types
+# (values are runtime-dynamic).
+def aux_data_fingerprint(v) -> tuple:
+    return (
+        get_aux_tensor_metadata(v.tensors) if v.tensors is not None else None,
+        tuple(type(s) for s in v.scalars) if v.scalars is not None else None,
+    )
+
+
+def aux_data_compile_arg(pool, v):
+    from flash_attn.cute.utils import AuxData
+
+    return AuxData(
+        [to_cute_aux_tensor(t) for t in v.tensors] if v.tensors is not None else None,
+        v.scalars,
+    )
+
+
+def aux_data_call_arg(v):
+    return v
+
+
+# Backward-kernel variant: aux tensors are compiled fully dynamic with no
+# alignment assumption, and only their count (not per-tensor metadata) is
+# compile-relevant.
+def aux_data_bwd_fingerprint(v) -> tuple:
+    return (
+        len(v.tensors) if v.tensors else 0,
+        tuple(type(s) for s in v.scalars) if v.scalars is not None else None,
+    )
+
+
+def aux_data_bwd_compile_arg(pool, v):
+    from flash_attn.cute.utils import AuxData
+
+    return AuxData(
+        [to_cute_tensor(t, assumed_align=None, fully_dynamic=True) for t in v.tensors]
+        if v.tensors is not None
+        else None,
+        v.scalars,
     )
 
 

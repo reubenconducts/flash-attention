@@ -386,7 +386,7 @@ def block_sparse_imports():
         sys.modules["flash_attn"] = stub
     if str(REPO_ROOT / "tests" / "cute") not in sys.path:
         sys.path.insert(0, str(REPO_ROOT / "tests" / "cute"))
-    from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
+    from flash_attn.cute.kernels.block_sparse.compute_block_sparsity import compute_block_sparsity
     from mask_mod_definitions import get_mask_pair
 
     return compute_block_sparsity, get_mask_pair

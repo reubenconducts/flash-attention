@@ -4,36 +4,14 @@ Block-sparsity utilities for FlexAttention
 
 from typing import Callable, NamedTuple, Tuple
 
-import cutlass.cute as cute
 import torch
 
 from flash_attn.cute.cute_dsl_utils import get_broadcast_dims, to_cute_tensor
+from flash_attn.cute.kernels.block_sparse.block_sparse_utils import BlockSparseTensors
 
 
 def ceildiv(a: int, b: int) -> int:
     return (a + b - 1) // b
-
-
-class BlockSparseTensors(NamedTuple):
-    mask_block_cnt: cute.Tensor
-    mask_block_idx: cute.Tensor
-    full_block_cnt: cute.Tensor | None = None
-    full_block_idx: cute.Tensor | None = None
-    cu_total_m_blocks: cute.Tensor | None = None
-    cu_block_idx_offsets: cute.Tensor | None = None
-    dq_write_order: cute.Tensor | None = None
-    dq_write_order_full: cute.Tensor | None = None
-
-    def __new_from_mlir_values__(self, values):
-        new_fields = []
-        idx = 0
-        for original in self:
-            if original is None:
-                new_fields.append(None)
-            else:
-                new_fields.append(values[idx])
-                idx += 1
-        return BlockSparseTensors(*new_fields)
 
 
 class BlockSparseTensorsTorch(NamedTuple):
@@ -667,6 +645,48 @@ def to_cute_block_sparse_tensors(
         cu_block_idx_offsets_tensor,
         dq_write_order_tensor,
         dq_write_order_full_tensor,
+    )
+
+
+# Composite-argument hooks for kernel_compiler Args declarations. The Args
+# field value is the *normalized* BlockSparseTensorsTorch (or None); its
+# compile-relevant structure is the broadcast pattern (stride-0 dims are baked
+# static by mark_layout_dynamic) plus which optional sub-tensors are present.
+def block_sparse_fingerprint(v: BlockSparseTensorsTorch | None):
+    if v is None:
+        return None
+    return (
+        get_block_sparse_broadcast_pattern(v),
+        # Presence of every optional sub-tensor is baked into the compiled
+        # BlockSparseTensors layout, so it must be part of the key.
+        tuple(
+            t is None
+            for t in (
+                v.full_block_cnt,
+                v.full_block_idx,
+                v.cu_total_m_blocks,
+                v.cu_block_idx_offsets,
+                v.dq_write_order,
+                v.dq_write_order_full,
+            )
+        ),
+    )
+
+
+def block_sparse_compile_arg(pool, v):
+    return to_cute_block_sparse_tensors(v)
+
+
+def block_sparse_call_arg(v) -> tuple:
+    return (
+        v.mask_block_cnt,
+        v.mask_block_idx,
+        v.full_block_cnt,
+        v.full_block_idx,
+        v.cu_total_m_blocks,
+        v.cu_block_idx_offsets,
+        v.dq_write_order,
+        v.dq_write_order_full,
     )
 
 

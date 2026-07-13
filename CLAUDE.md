@@ -55,7 +55,7 @@ If you get OOM errors running tests or benchmarks, use `nvidia-smi` to find a fr
 
 ## Linting
 
-Pre-commit uses ruff on `flash_attn/cute/` files. Large kernel files (`flash_bwd.py`, `flash_fwd.py`, `flash_fwd_sm100.py`, `interface.py`) are excluded from auto-formatting.
+Pre-commit uses ruff on `flash_attn/cute/` files. Large kernel files (`kernels/backward/flash_bwd.py`, `kernels/forward/flash_fwd.py`, `kernels/forward/flash_fwd_sm100.py`, `interface.py`) are excluded from auto-formatting.
 
 ```bash
 ruff check flash_attn/cute/ --fix
@@ -74,20 +74,29 @@ Key parameters: `causal`, `window_size_left/right`, `softmax_scale`, `softcap`, 
 
 Tensor layout: `(batch, seqlen, num_heads, head_dim)`, last dim contiguous, 16-byte aligned.
 
-### Forward Kernels
+### Forward Kernels (`flash_attn/cute/kernels/forward/`)
 
-- `flash_fwd.py` — `FlashAttentionForwardSm90`: Hopper forward. No SplitKV or paged KV.
+- `flash_fwd.py` — `FlashAttentionForwardSm80` (+ `FlashAttentionForwardBase`): Ampere forward (base).
+- `flash_fwd_sm90.py` — `FlashAttentionForwardSm90`: Hopper forward. No SplitKV or paged KV.
 - `flash_fwd_sm100.py` — `FlashAttentionForwardSm100`: Blackwell forward. Full features including SplitKV, paged KV cache, persistent kernels, 2CTA instructions.
+- `flash_fwd_sm120.py` — `FlashAttentionForwardSm120`: Blackwell GeForce (SM80 MMA, SM120 SMEM).
+- `flash_fwd_mla_sm100.py` — `FlashAttentionMLAForwardSm100`: MLA (qv) forward.
+- `sm100_hd256_2cta_fmha_forward.py` — dedicated head_dim=256 2CTA forward.
 - `flash_fwd_combine.py` — `FlashAttentionForwardCombine`: merges SplitKV partial results.
 
-### Backward Kernels
+### Backward Kernels (`flash_attn/cute/kernels/backward/`)
 
 - `flash_bwd.py` — `FlashAttentionBackwardSm80`: Ampere backward (base).
 - `flash_bwd_sm90.py` — `FlashAttentionBackwardSm90`: Hopper backward.
 - `flash_bwd_sm100.py` — `FlashAttentionBackwardSm100`: Blackwell backward with 2CTA and block sparse support.
+- `flash_bwd_sm120.py` — `FlashAttentionBackwardSm120`: Blackwell GeForce backward.
 - `flash_bwd_preprocess.py` / `flash_bwd_postprocess.py` — auxiliary backward kernels.
+- `flash_bwd_mla_*.py`, `sm100_hd256_2cta_fmha_backward*.py` — sparse MLA and head_dim=256 backward kernels.
 
-### Core Abstractions
+### Device-Side Building Blocks (`flash_attn/cute/kernels/common/`)
+
+Everything under `flash_attn/cute/kernels/` traces into the kernels (device code);
+the `flash_attn/cute/` top level is host-side machinery and API.
 
 - `softmax.py` — Online softmax with row_max/row_sum tracking, score modifier support.
 - `mask.py` — `AttentionMask`: causal, local/sliding window, block sparse, mask_mod application.
@@ -96,22 +105,36 @@ Tensor layout: `(batch, seqlen, num_heads, head_dim)`, last dim contiguous, 16-b
 - `pipeline.py` — `PipelineStateSimple`: circular buffer index/phase management for pipelined loads.
 - `tile_scheduler.py` — Tile scheduling strategies (single tile, varlen-aware, persistent).
 - `copy_utils.py` — Type-converting copies, shared-to-register loads, TMA copy atoms.
-- `named_barrier.py` — Named barrier enums for warp synchronization.
-
-### Architecture-Specific Helpers
-
-- `hopper_helpers.py` — SM90 warp-group GEMM, shared memory layout creation, fence/commit/wait.
-- `blackwell_helpers.py` — SM100 UMMA-based GEMM, PTX-optimized paths, 2CTA support.
-- `mma_sm100_desc.py` — Hardware MMA descriptor enums (formats, saturation, scaling).
-
-### Other Components
-
+- `barrier.py` / `named_barrier.py` — Barrier helpers and named barrier enums for warp synchronization.
 - `pack_gqa.py` — Packs multiple Q heads per KV head for efficient GQA.
 - `paged_kv.py` — `PagedKVManager`: paged KV cache with TMA support.
-- `fast_math.py` — exp2 polynomial coefficients, softcap score_mod creation.
+- `topk_gather_kv.py` — cp.async gather of top-k KV blocks (sparse MLA).
+- `fast_math.py` — exp2 polynomial coefficients.
+
+### Architecture-Specific Helpers (`flash_attn/cute/kernels/arch/`)
+
+- `ampere_helpers.py` — SM80 MMA and smem layout helpers.
+- `blackwell_helpers.py` — SM100 UMMA-based GEMM, PTX-optimized paths, 2CTA support.
+- `mma_sm100_desc.py` — Hardware MMA descriptor enums (formats, saturation, scaling).
+- (SM90 warp-group GEMM helpers come from `quack.sm90_utils`.)
+
+### Block Sparsity
+
+- `flash_attn/cute/block_sparsity.py` — host-side model: `BlockSparseTensorsTorch`,
+  normalization, cute conversion, compile-key fingerprints.
+- `flash_attn/cute/kernels/block_sparse/block_sparse_utils.py` — device-side:
+  `BlockSparseTensors` (what kernels receive) and in-kernel block iteration.
+- `flash_attn/cute/kernels/block_sparse/compute_block_sparsity.py` — standalone
+  kernel program computing block tensors from a `mask_mod`.
+
+### Host-Side Machinery (`flash_attn/cute/` top level)
+
+- `kernel_compiler.py` — self-describing kernel compilation: per-kernel `Params`/`Args`
+  declarations, cache keys, kernel-symbol naming, `run_kernel`.
 - `utils.py` — Hash functions for compile cache keys, warp reductions, predicates.
 - `cache_utils.py` — JIT compilation cache management.
-- `cute_dsl_utils.py` — Patched `cute.compile` that optionally dumps SASS.
+- `cute_dsl_utils.py` — torch↔cute tensor conversion; patched `cute.compile` that optionally dumps SASS.
+- `bench/` — benchmark and tuning tooling (not part of the attention library proper).
 
 ### Compilation & Caching
 
